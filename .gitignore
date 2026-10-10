@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+build/
+*.mp4
+*.mkv
+*.wav
+*.raw
