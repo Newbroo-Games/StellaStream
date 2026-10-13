@@ -43,21 +43,25 @@ On Windows, double-clicking `stellastream.pyw` works too.
 
 ![The window while it records](images/window.png)
 
-1. Choose the game's ROM. The video is named after it and saved next to it,
-   until you name it something else.
+1. Choose the game's ROM. The video and the capture are named after it and
+   saved next to it, until you name them something else.
 2. If Stella can't tell, choose the controllers and the TV format (a driving
    game needs Driving, for example).
-3. Press **Record** and play in Stella's window. **Stop**, closing Stella, or
-   the time limit ends the recording, and the video is finished.
-4. **Open video** plays it; **Show folder** shows where it is.
+3. Choose what to save: a **Video**, a **Capture** (the whole stream in a small
+   file, see [Capture files](#capture-files)), or **Both**. A capture alone
+   needs no ffmpeg and little CPU while you play; make videos from it later.
+4. Press **Record** and play in Stella's window. **Stop**, closing Stella, or
+   the time limit ends the recording, and the files are finished.
+5. **Open video** plays the video; **Show folder** shows where the files are.
 
 Good to know:
 
-- A video is never replaced: if the name is taken, the new one becomes
-  `game-2.mp4`, `game-3.mp4`, and so on.
-- Closing the window while recording stops the recording and saves the video
+- A file is never replaced: if the name is taken, the new one becomes
+  `game-2.mp4`, `game-3.mp4`, and so on; a video and capture saved together
+  keep the same number.
+- Closing the window while recording stops the recording and saves the files
   first.
-- With **Hear the game** off, Stella plays silently; the video has the sound
+- With **Hear the game** off, Stella plays silently; the files have the sound
   either way, because it comes from the stream.
 - The **Stella command** box shows exactly what the window runs, so you can
   see the option at work, or copy it.
@@ -77,13 +81,46 @@ python record.py --rom path/to/game.bin game.mp4
 Options: `--scale 2` for 1280-wide video, `--stereo`, `--seconds 60` to stop
 after a minute, `--stella-args="-lc Driving"` for any other Stella options
 (here, a driving controller on the left port), `--ffmpeg <path>` if ffmpeg
-isn't on the PATH. Ctrl+C also stops and finishes the video.
+isn't on the PATH, `--capture game.sscap` to save a capture of the same play
+too. Ctrl+C also stops and finishes the video.
 
 Record from a stream saved earlier with `Stella -rawstream capture.raw game.bin`:
 
 ```
 python record.py capture.raw game.mp4
 ```
+
+## Capture files
+
+A capture file (`.sscap`) keeps the whole stream (every frame, every sound
+sample, the RAM) packed in one-second blocks: in our tests about 300 times
+smaller than the raw stream, some 7 KB a second or 25 MB an hour. Make videos
+from it whenever you like.
+
+Save one while you play; close Stella to finish:
+
+```
+python sscap.py --rom path/to/game.bin game.sscap
+```
+
+Make a video from it:
+
+```
+python record.py game.sscap game.mp4
+```
+
+Pack a raw stream, unpack a capture again, or check one (`-v`: a line per
+block):
+
+```
+python sscap.py capture.raw game.sscap
+python sscap.py game.sscap capture.raw
+python sscap.py game.sscap -v
+```
+
+The format is described in [docs/capture-format.md](docs/capture-format.md).
+
+## Check a stream
 
 Check a stream, and print RAM bytes every frame (addresses, or names from a
 DASM `.sym` file):
@@ -100,7 +137,8 @@ python -m unittest discover -s tests -t .
 
 The tests build their own tiny 2600 ROM (`tests/testrom.py`), run Stella on it
 silently with a settings folder of their own, and check the stream, the RAM
-against the picture, and the videos. The window's tests build it hidden, on a
+against the picture, the videos, and capture files (a round trip byte for
+byte, damaged files, the format spec's own decoder). The window's tests build it hidden, on a
 settings file of their own, and record that ROM from it. Without Stella or
 ffmpeg those tests are skipped.
 

@@ -1,7 +1,9 @@
 """Record a video from Stella's raw stream with ffmpeg.
 
     python record.py capture.raw out.mp4      from a stream file
+    python record.py game.sscap out.mp4       from a capture file (sscap.py)
     python record.py --rom game.bin out.mp4   play; close Stella to stop
+    (--capture game.sscap with --rom saves a capture of the same play too)
 
 Picture: the TIA colors through the stream's palette, scaled with sharp pixels
 to the TV shape (4x wide, 2x tall; --scale 2 doubles that), at 60 fps (NTSC)
@@ -13,9 +15,10 @@ is due (once, normally), so a game whose frames aren't exactly 262 lines stays
 in sync. Video goes to ffmpeg as it arrives, sound to a WAV file; the two are
 joined at the end without re-encoding the picture.
 
-As a module: record() turns any stream into a video; record_rom() runs Stella
-on a ROM and records it, and can be stopped from another thread. Both report
-progress through a callback and raise RecordError with a message for the user.
+As a module: record() turns any stream into a video; record_capture() does it
+from a capture file; record_rom() runs Stella on a ROM and records it, and can
+be stopped from another thread. They report progress through a callback and
+raise RecordError with a message for the user.
 """
 import argparse
 import subprocess
@@ -28,6 +31,7 @@ from pathlib import Path
 
 from rawstream import (Audio, End, Frame, Header, Jump, Palette, close_stella,
                        launch_stella, parse)
+from sscap import Capture, CaptureError, Writer, is_capture
 
 TV_SHAPE = (4, 2)  # a TIA pixel is about twice as wide as a scanline is tall
 PROGRESS_EVERY = 0.2  # seconds between progress calls
@@ -40,9 +44,10 @@ class RecordError(Exception):
 @dataclass
 class Result:
     path: Path
-    frames: int      # video frames written
-    seconds: float   # length of the video
+    frames: int      # video frames written (with no video: the stream's frames)
+    seconds: float   # length of the video (with no video: of the capture)
     end_seen: bool   # the stream ended with END: Stella closed normally
+    capture: Path = None  # the capture file saved too, if any
 
 
 def _log(message):
@@ -242,26 +247,126 @@ def record(stream, out_path, scale=1, stereo=False, seconds=None, crf=12, keep=F
                   frames_out * header.samples_per_frame / header.sample_rate, end_seen)
 
 
-def record_rom(rom, out_path, *, stella=None, stella_args=(), sound=True, own_settings=None,
-               head_timeout=10.0, stop=None, progress=None, log=_log, ffmpeg="ffmpeg", **video):
-    """Run Stella on rom and record it to out_path. Returns a Result.
+def record_capture(path, out_path, ffmpeg="ffmpeg", log=_log, **video):
+    """Turn a capture file (.sscap) into a video at out_path. Returns a Result.
+
+    A damaged block is skipped, so about a second is missing from the video
+    there, and log says so. video: record()'s other options. Raises
+    RecordError.
+    """
+    path = Path(path)
+    check_ffmpeg(ffmpeg)
+    try:
+        f = open(path, "rb")
+    except OSError as e:
+        raise RecordError(f"Can't open the capture: {e}") from None
+    with f:
+        try:
+            capture = Capture(f)
+        except CaptureError as e:
+            raise RecordError(f"Can't read the capture {path.name}: {e}.") from None
+        if not capture.indexed:
+            log(f"The capture has no index ({capture.index_problem}); "
+                "it is read block by block.")
+
+        def damaged(block, error):
+            log(f"Skipped a damaged part of the capture ({error}): about a second "
+                "is missing from the video there.")
+
+        return record(capture.stream(on_damage=damaged), out_path, ffmpeg=ffmpeg, log=log,
+                      **video)
+
+
+class _Tee:
+    """A stream that also hands every byte read from it to a capture Writer."""
+
+    def __init__(self, stream, writer):
+        self._stream, self._writer = stream, writer
+
+    def read(self, n=-1):
+        data = self._stream.read(n)
+        if data:
+            self._writer.write(data)
+        return data
+
+
+def save_capture(stream, writer, path, seconds=None, progress=None, stop=None, started=None,
+                 finishing=None, log=_log):
+    """Save a raw stream as a capture, with no video: writer is the
+    sscap.Writer writing path. Returns a Result (frames: the stream's frames).
+    seconds, progress (bytes: the capture's), stop, started, finishing and log
+    work as in record(). Raises RecordError."""
+    header = None
+    frames = 0
+    end_seen = False
+    next_progress = 0.0
+
+    def emulated():
+        return writer.cycles / header.cycles_per_second
+
+    def report_progress():
+        if progress and header:
+            progress(frames, emulated(), writer.bytes_out)
+
+    try:
+        for item in parse(_Tee(stream, writer)):
+            if stop is not None and stop.is_set():
+                break
+            if isinstance(item, Header):
+                if header is None:
+                    header = item
+                    if started is not None:
+                        started.set()
+                    log(f"{header.timing_name}, ROM '{header.rom_name}'")
+            elif isinstance(item, Frame) and header:
+                frames += 1
+                if time.monotonic() >= next_progress:
+                    report_progress()
+                    next_progress = time.monotonic() + PROGRESS_EVERY
+                if seconds and emulated() >= seconds:
+                    break
+            elif isinstance(item, End):
+                end_seen = True
+    except KeyboardInterrupt:
+        log("Stopped")
+    finally:
+        if finishing is not None:
+            finishing.set()
+    if not frames:
+        raise RecordError("No frames were recorded.")
+    report_progress()
+    return Result(Path(path), frames, emulated(), end_seen, capture=Path(path))
+
+
+def record_rom(rom, out_path=None, *, capture=None, stella=None, stella_args=(), sound=True,
+               own_settings=None, head_timeout=10.0, stop=None, progress=None, log=_log,
+               ffmpeg="ffmpeg", **video):
+    """Run Stella on rom and record it: a video to out_path, a capture file
+    (.sscap) to capture, or both from the same stream. Returns a Result (path:
+    the video, or the capture when there is no video).
 
     The recording ends when Stella is closed, when stop (a threading.Event) is
     set, which asks Stella to close, or after video['seconds']. sound: Stella
-    plays the game's sound (the video gets it either way). own_settings: Stella
+    plays the game's sound (the files get it either way). own_settings: Stella
     uses a settings folder of its own (default: when silent, as for tests).
-    video: record()'s scale, stereo, seconds, crf, keep and finishing. Raises
-    RecordError.
+    video: record()'s scale, stereo, seconds, crf, keep and finishing. A
+    capture alone needs no ffmpeg. Raises RecordError.
     """
     rom = Path(rom)
-    out_path = Path(out_path)
+    if out_path is None and capture is None:
+        raise ValueError("nothing to save: give out_path, capture or both")
+    out_path = Path(out_path) if out_path else None
+    capture = Path(capture) if capture else None
     if not rom.is_file():
         raise RecordError(f"The ROM file isn't there: {rom}")
-    try:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        raise RecordError(f"Can't make the video's folder {out_path.parent}: {e}") from None
-    check_ffmpeg(ffmpeg)
+    for target in (out_path, capture):
+        if target:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise RecordError(f"Can't make the folder {target.parent}: {e}") from None
+    if out_path:
+        check_ffmpeg(ffmpeg)
     if own_settings is None:
         own_settings = not sound
     try:
@@ -292,22 +397,45 @@ def record_rom(rom, out_path, *, stella=None, stella_args=(), sound=True, own_se
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
+    capture_file = writer = None
     try:
-        return record(proc.stdout, out_path, ffmpeg=ffmpeg, progress=progress,
-                      started=started, log=log, **video)
-    except RecordError:
-        if started.is_set():
-            raise
-        if timed_out:
-            raise RecordError(f"Stella sent no stream in {head_timeout:g} s. Is it a Stella "
-                              "with -rawstream, and does the ROM load?") from None
-        raise RecordError("Stella closed without sending a stream. Is it a Stella with "
-                          "-rawstream, and does the ROM load?") from None
+        if capture:
+            try:
+                capture_file = open(capture, "wb")
+            except OSError as e:
+                raise RecordError(f"Can't write the capture {capture}: {e.strerror or e}") from None
+            writer = Writer(capture_file, background=True)  # never holds the pipe up
+        if out_path:
+            result = record(_Tee(proc.stdout, writer) if writer else proc.stdout, out_path,
+                            ffmpeg=ffmpeg, progress=progress, started=started, log=log, **video)
+        else:
+            result = save_capture(proc.stdout, writer, capture, seconds=video.get("seconds"),
+                                  progress=progress, started=started,
+                                  finishing=video.get("finishing"), log=log)
+    except RecordError as e:
+        if not started.is_set():
+            if timed_out:
+                raise RecordError(f"Stella sent no stream in {head_timeout:g} s. Is it a "
+                                  "Stella with -rawstream, and does the ROM load?") from None
+            raise RecordError("Stella closed without sending a stream. Is it a Stella with "
+                              "-rawstream, and does the ROM load?") from None
+        if writer and writer.frames:
+            raise RecordError(f"{e} The capture was saved: {capture.name}") from None
+        raise
     finally:
         finished.set()
         watcher.join()
         proc.stdout.close()  # what's left unread doesn't hold Stella up
         close_stella(proc)
+        if writer:
+            writer.close()
+        if capture_file:
+            capture_file.close()
+            if writer and not writer.frames:
+                capture.unlink(missing_ok=True)  # Stella sent nothing to keep
+    if capture:
+        result.capture = capture
+    return result
 
 
 def _cli_progress():
@@ -324,7 +452,8 @@ def _cli_progress():
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("source", nargs="?", help="stream file written with -rawstream <file>")
+    ap.add_argument("source", nargs="?",
+                    help="stream file written with -rawstream <file>, or a capture (.sscap)")
     ap.add_argument("output", help="video file to write, e.g. out.mp4")
     ap.add_argument("--rom", help="run Stella on this ROM and record while you play")
     ap.add_argument("--scale", type=int, default=1, help="multiply the 4x2 TV shape (default 1)")
@@ -338,22 +467,28 @@ def main():
     ap.add_argument("--stella-args", default="",
                     help='with --rom: more Stella options, e.g. --stella-args="-lc Driving"')
     ap.add_argument("--ffmpeg", default="ffmpeg", help="the ffmpeg to run (default: ffmpeg)")
+    ap.add_argument("--capture", help="with --rom: also save the stream as a capture (.sscap)")
     args = ap.parse_args()
 
     if bool(args.source) == bool(args.rom):
         ap.error("give a stream file or --rom, not both")
+    if args.capture and not args.rom:
+        ap.error("--capture goes with --rom")
 
     video = dict(scale=args.scale, stereo=args.stereo, seconds=args.seconds,
                  crf=args.crf, keep=args.keep)
     progress = _cli_progress()
     try:
-        if args.source:
+        if args.source and is_capture(args.source):
+            result = record_capture(args.source, args.output, ffmpeg=args.ffmpeg,
+                                    progress=progress, **video)
+        elif args.source:
             check_ffmpeg(args.ffmpeg)
             with open(args.source, "rb") as f:
                 result = record(f, args.output, ffmpeg=args.ffmpeg, progress=progress, **video)
         else:
             # The user is playing: their own settings and sound, unless --silent
-            result = record_rom(args.rom, args.output, stella=args.stella,
+            result = record_rom(args.rom, args.output, capture=args.capture, stella=args.stella,
                                 stella_args=args.stella_args.split(), sound=not args.silent,
                                 ffmpeg=args.ffmpeg, progress=progress, **video)
     except (RecordError, OSError) as e:
@@ -365,6 +500,8 @@ def main():
         print(file=sys.stderr)
     print(f"Wrote {result.path} ({result.frames} frames, {result.seconds:.1f} s)",
           file=sys.stderr)
+    if result.capture:
+        print(f"Wrote {result.capture}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -152,6 +152,29 @@ class BeforeRecording(unittest.TestCase):
         (self.folder / "game-2.audio.wav").touch()  # kept from an earlier recording
         self.assertEqual(app.free_name(video), self.folder / "game-3.mp4")
 
+    def test_free_names_keep_one_number(self):
+        video, capture = self.folder / "game.mp4", self.folder / "game.sscap"
+        numbered = lambda n: (self.folder / f"game-{n}.mp4", self.folder / f"game-{n}.sscap")
+        self.assertEqual(app.free_names(video, capture), (video, capture))
+        video.touch()
+        self.assertEqual(app.free_names(video, capture), numbered(2))
+        numbered(2)[1].touch()  # only the capture of that name is there
+        self.assertEqual(app.free_names(video, capture), numbered(3))
+        self.assertEqual(app.free_names(None, capture), (None, capture))
+        capture.touch()
+        self.assertEqual(app.free_names(None, capture), (None, numbered(3)[1]))
+
+    def test_there_already(self):
+        video, capture = self.folder / "game.mp4", self.folder / "game.sscap"
+        self.assertEqual(app.there_already(video, capture), [])
+        capture.touch()
+        self.assertEqual(app.there_already(video, capture), [capture])
+        self.assertEqual(app.there_already(video), [])
+        video.touch()
+        (self.folder / "game.audio.wav").touch()
+        self.assertEqual(app.there_already(video, capture),
+                         [video, self.folder / "game.audio.wav", capture])
+
     def test_a_bare_video_name_goes_next_to_the_rom(self):
         s = fields(rom=str(self.rom), video="mine.mp4")
         self.assertEqual(app.video_path(s), self.folder / "mine.mp4")
@@ -174,6 +197,19 @@ class BeforeRecording(unittest.TestCase):
         self.assertIsNone(app.check_fields(fields(**dict(good, stella="")), "Stella.exe"))
         self.assertIsNone(app.check_fields(fields(**good)))
         self.assertTrue((self.folder / "out").is_dir(), "the video's folder is made")
+
+    def test_capture_problems(self):
+        good = dict(rom=str(self.rom), stella=sys.executable, save="CAPTURE", video="",
+                    capture=str(self.folder / "caps" / "game.sscap"))
+        self.assertIsNone(app.check_fields(fields(**good)), "a capture alone needs no video")
+        self.assertTrue((self.folder / "caps").is_dir(), "the capture's folder is made")
+        for changes, message in ((dict(capture=" "), "Choose where to save the capture"),
+                                 (dict(capture="game.cap"), "must end in .sscap"),
+                                 (dict(save="BOTH"), "Choose where to save the video")):
+            self.assertIn(message, app.check_fields(fields(**dict(good, **changes))), changes)
+        self.assertIsNone(app.check_fields(fields(**dict(good, save="VIDEO", video="game.mp4",
+                                                         capture="game.cap"))),
+                          "a capture that isn't saved isn't checked")
 
     def test_clock(self):
         self.assertEqual((app.clock(42.9), app.clock(600), app.clock(3723)),
@@ -228,6 +264,33 @@ class Window(unittest.TestCase):
         v["rom"].set(str(Path("roms") / "three.bin"))
         self.assertEqual(v["video"].get(), "mine.mp4")
 
+    def test_capture_follows_the_video_until_named(self):
+        v = self.window.vars
+        v["rom"].set(str(Path("roms") / "one.bin"))
+        self.assertEqual(v["capture"].get(), str(Path("roms") / "one.sscap"))
+        v["video"].set("mine.mp4")
+        self.assertEqual(v["capture"].get(), "mine.sscap")
+        v["capture"].set("keep.sscap")
+        v["video"].set("other.mp4")
+        self.assertEqual(v["capture"].get(), "keep.sscap")
+
+    def test_the_file_not_saved_is_greyed(self):
+        w = self.window
+
+        def greyed(widgets):
+            return [widget.instate(["disabled"]) for widget in widgets]
+
+        self.assertTrue(all(greyed(w.for_capture)) and not any(greyed(w.for_video)))
+        w.vars["save"].set("Capture")
+        self.assertTrue(all(greyed(w.for_video)) and not any(greyed(w.for_capture)))
+        w.vars["save"].set("Both")
+        self.assertFalse(any(greyed(w.for_video + w.for_capture)))
+        w.vars["save"].set("Video")
+        w._lock(True)
+        self.assertTrue(all(greyed(w.for_video + w.for_capture)), "all locked while recording")
+        w._lock(False)
+        self.assertTrue(all(greyed(w.for_capture)) and not any(greyed(w.for_video)))
+
     def test_a_bad_number_keeps_the_last_good_one(self):
         v = self.window.vars
         v["seconds"].set("45")
@@ -253,11 +316,13 @@ class Window(unittest.TestCase):
         v["scale"].set("2")
         v["time_limit"].set(True)
         v["more"].set(True)
+        v["save"].set("Both")
         self.window.close()
         saved = app.load_settings(self.path)
         self.assertEqual((saved["rom"], saved["video"], saved["right"], saved["scale"],
                           saved["time_limit"], saved["more"]),
                          ("game.bin", "game.mp4", "PADDLES", 2, True, True))
+        self.assertEqual((saved["save"], saved["capture"]), ("BOTH", "game.sscap"))
         self.root = tk.Tk()
         self.root.withdraw()
         again = app.App(self.root, settings_file=self.path)
@@ -345,6 +410,29 @@ class WindowRecords(unittest.TestCase):
             self.assertFalse(w.open_button.instate(["disabled"]))
             self.assertFalse(w.folder_button.instate(["disabled"]))
         self.assertIn("(window.mp4 was there already)", w.status.get())
+
+    def test_capture_alone_then_both(self):
+        w = self.window
+        w.vars["time_limit"].set(True)
+        w.vars["seconds"].set("1")
+        w.vars["save"].set("Capture")
+        w.record_button.invoke()
+        self.run_window(lambda: w.job is None)
+        self.assertTrue(w.status.get().startswith(f"Saved {BUILD / 'window.sscap'}: 00:01"),
+                        w.status.get())
+        self.assertTrue((BUILD / "window.sscap").is_file())
+        self.assertFalse((BUILD / "window.mp4").exists())
+        self.assertTrue(w.open_button.instate(["disabled"]), "a capture has no player to open")
+        self.assertFalse(w.folder_button.instate(["disabled"]))
+        w.vars["save"].set("Both")
+        (BUILD / "window.mp4").touch()  # so both names are taken
+        w.record_button.invoke()
+        self.run_window(lambda: w.job is None)
+        self.assertIn("window-2.mp4 and window-2.sscap (window.mp4 and window.sscap were there "
+                      "already): 00:01, 60 frames", w.status.get())
+        self.assertFalse(w.open_button.instate(["disabled"]))
+        for name in ("window-2.mp4", "window-2.sscap"):
+            self.assertTrue((BUILD / name).is_file(), name)
 
     def test_stop(self):
         w = self.window

@@ -36,11 +36,12 @@ CONTROLLERS = [
 ]
 TV_FORMATS = [("Auto", "AUTO"), ("NTSC", "NTSC"), ("PAL", "PAL"), ("SECAM", "SECAM"),
               ("NTSC50", "NTSC50"), ("PAL60", "PAL60"), ("SECAM60", "SECAM60")]
-CHOICES = {"left": CONTROLLERS, "right": CONTROLLERS, "format": TV_FORMATS}
+SAVE_MODES = [("Video", "VIDEO"), ("Capture", "CAPTURE"), ("Both", "BOTH")]
+CHOICES = {"left": CONTROLLERS, "right": CONTROLLERS, "format": TV_FORMATS, "save": SAVE_MODES}
 
 DEFAULTS = {
     "rom": "", "left": "AUTO", "right": "AUTO", "format": "AUTO",
-    "video": "", "scale": 1, "stereo": False, "hear": True,
+    "save": "VIDEO", "video": "", "capture": "", "scale": 1, "stereo": False, "hear": True,
     "time_limit": False, "seconds": 60,
     "more": False, "stella": "", "ffmpeg": "ffmpeg", "extra": "", "crf": 12, "keep": False,
 }
@@ -130,23 +131,57 @@ def default_video(rom):
     return str(rom.with_suffix(".mp4")) if rom.name else ""
 
 
+def default_capture(video):
+    """The capture's name when the user hasn't chosen one: the video's, as .sscap."""
+    video = Path(video.strip())
+    return str(video.with_suffix(".sscap")) if video.name else ""
+
+
+def _beside_rom(s, key):
+    """The path in field key; a name without a folder, or a relative path,
+    counts from the ROM's folder."""
+    path = Path(s[key].strip())
+    return path if path.is_absolute() else Path(s["rom"].strip()).absolute().parent / path
+
+
 def video_path(s):
-    """Where settings s save the video. A name without a folder, or a
-    relative path, counts from the ROM's folder."""
-    video = Path(s["video"].strip())
-    return video if video.is_absolute() else Path(s["rom"].strip()).absolute().parent / video
+    """Where settings s save the video."""
+    return _beside_rom(s, "video")
+
+
+def capture_path(s):
+    """Where settings s save the capture."""
+    return _beside_rom(s, "capture")
+
+
+def _numbered(path, n):
+    path = Path(path)
+    return path if n == 1 else path.with_name(f"{path.stem}-{n}{path.suffix}")
+
+
+def free_names(video=None, capture=None):
+    """(video, capture), or the first game-2, game-3, ... that is free for
+    both, so the two keep the same number: a recording never replaces a
+    file, nor record()'s separate picture and sound files. None for a file
+    not saved."""
+    n = 1
+    while True:
+        names = tuple(_numbered(p, n) if p else None for p in (video, capture))
+        if not there_already(*names):
+            return names
+        n += 1
+
+
+def there_already(video=None, capture=None):
+    """The files a recording to video and capture would replace: those two
+    and record()'s separate picture and sound files, the ones that exist."""
+    files = ([video, *record.side_files(video)] if video else []) + [capture]
+    return [p for p in files if p and p.exists()]
 
 
 def free_name(video):
-    """video, or the first of game-2.mp4, game-3.mp4, ... that is free: a
-    recording never replaces a file, nor record()'s separate picture and
-    sound files."""
-    video = Path(video)
-    name, n = video, 1
-    while any(p.exists() for p in (name, *record.side_files(name))):
-        n += 1
-        name = video.with_name(f"{video.stem}-{n}{video.suffix}")
-    return name
+    """free_names() for a video alone."""
+    return free_names(video)[0]
 
 
 def check_fields(s, found_stella=None):
@@ -158,11 +193,21 @@ def check_fields(s, found_stella=None):
         return "Choose the game's ROM file."
     if not Path(rom).is_file():
         return f"The ROM file isn't there: {rom}"
-    if not s["video"].strip():
-        return "Choose where to save the video."
-    video = video_path(s)
-    if video.suffix.lower() not in VIDEO_TYPES:
-        return "The video's name must end in .mp4 (or .mkv or .mov)."
+    targets = []  # (what, path) for each file saved
+    if s["save"] != "CAPTURE":
+        if not s["video"].strip():
+            return "Choose where to save the video."
+        video = video_path(s)
+        if video.suffix.lower() not in VIDEO_TYPES:
+            return "The video's name must end in .mp4 (or .mkv or .mov)."
+        targets.append(("video", video))
+    if s["save"] != "VIDEO":
+        if not s["capture"].strip():
+            return "Choose where to save the capture."
+        capture = capture_path(s)
+        if capture.suffix.lower() != ".sscap":
+            return "The capture's name must end in .sscap."
+        targets.append(("capture", capture))
     stella = s["stella"].strip()
     if stella and not (Path(stella).is_file() or shutil.which(stella)):
         return (f"Stella isn't there: {stella}. Choose it under More options, or empty "
@@ -173,12 +218,13 @@ def check_fields(s, found_stella=None):
         split_options(s["extra"])
     except ValueError:
         return "Extra Stella options: a quote isn't closed."
-    try:
-        video.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryFile(dir=video.parent):
-            pass
-    except OSError as e:
-        return f"Can't save the video in {video.parent}: {e.strerror or e}"
+    for what, path in targets:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryFile(dir=path.parent):
+                pass
+        except OSError as e:
+            return f"Can't save the {what} in {path.parent}: {e.strerror or e}"
     return None
 
 
@@ -210,14 +256,24 @@ def open_file(path):
 @dataclass
 class Job:
     """A recording under way: its worker thread and what it shares with the window."""
-    video: Path   # the file it is saved to
-    asked: Path   # the file the fields name; video differs when that one was there already
+    video: Path   # the video it is saved to; None when only a capture is saved
+    asked: Path   # the video the fields name; video differs when that one was there already
+    capture: Path = None        # the capture it is saved to, if any
+    asked_capture: Path = None  # the capture the fields name
+    there: list = field(default_factory=list)  # the files named that were there already
     thread: threading.Thread = None
     messages: queue.Queue = field(default_factory=queue.Queue)
     stop: threading.Event = field(default_factory=threading.Event)
     finishing: threading.Event = field(default_factory=threading.Event)
     progress: tuple = None  # the latest (frames, seconds, bytes)
     notes: list = field(default_factory=list)
+
+    @property
+    def what(self):
+        """'the video', 'the capture' or 'the files', for the status line."""
+        if self.video and self.capture:
+            return "the files"
+        return "the video" if self.video else "the capture"
 
 
 def record_in_thread(messages, **kwargs):
@@ -239,10 +295,13 @@ class App:
         self.settings_file = Path(settings_file) if settings_file else settings_path()
         self.found_stella = rawstream.find_stella()
         s = load_settings(self.settings_file)
+        if not s["capture"].strip():
+            s["capture"] = default_capture(s["video"])
         self._good = dict(s)  # last valid value of each number field
         self._save_job = None
         self._more_shown = None
         self._last_rom = s["rom"]
+        self._last_video = s["video"]
         self._wrap = None
         self.inputs = []          # what is locked while recording
         self.job = None           # the recording under way
@@ -262,6 +321,7 @@ class App:
 
         self._build()
         self.vars["rom"].trace_add("write", self._rom_changed)
+        self.vars["video"].trace_add("write", self._video_changed)
         for var in self.vars.values():
             var.trace_add("write", self._changed)
         self._update()
@@ -290,27 +350,39 @@ class App:
         self._label(game, 2, "TV format")
         self._combo(game, "format", TV_FORMATS).grid(row=2, column=1, sticky="w", pady=PADY)
 
-        video = self._box(main, 1, "Video")
-        self._file_row(video, 0, "Save video to", "video", self._browse_video)
-        self._label(video, 1, "Size")
+        video = self._box(main, 1, "Save")
+        self._label(video, 0, "Save")
+        modes = ttk.Frame(video)
+        modes.grid(row=0, column=1, columnspan=2, sticky="w", pady=PADY)
+        for i, (shown, _) in enumerate(SAVE_MODES):
+            self._input(ttk.Radiobutton(modes, text=shown, variable=v["save"], value=shown)).pack(
+                side="left", padx=(0 if i == 0 else 16, 0))
+        # Fields that only matter for one of the two files: greyed when it isn't saved
+        self.for_video = self._file_row(video, 1, "Video file", "video", self._browse_video)
+        self.for_capture = self._file_row(video, 2, "Capture file", "capture",
+                                          self._browse_capture)
+        self._label(video, 3, "Size")
         sizes = ttk.Frame(video)
-        sizes.grid(row=1, column=1, columnspan=2, sticky="w", pady=PADY)
-        self._input(ttk.Radiobutton(sizes, text="640 x 456", variable=v["scale"],
-                                    value="1")).pack(side="left")
-        self._input(ttk.Radiobutton(sizes, text="1280 x 912", variable=v["scale"],
-                                    value="2")).pack(side="left", padx=(16, 0))
+        sizes.grid(row=3, column=1, columnspan=2, sticky="w", pady=PADY)
+        self.for_video += [
+            self._input(ttk.Radiobutton(sizes, text="640 x 456", variable=v["scale"], value="1")),
+            self._input(ttk.Radiobutton(sizes, text="1280 x 912", variable=v["scale"],
+                                        value="2"))]
+        self.for_video[-2].pack(side="left")
+        self.for_video[-1].pack(side="left", padx=(16, 0))
         ttk.Label(sizes, text="(PAL games: 640 x 548 and 1280 x 1096)",
                   style="Note.TLabel").pack(side="left", padx=(16, 0))
         sound = ttk.Frame(video)
-        sound.grid(row=2, column=0, columnspan=3, sticky="w", pady=PADY)
-        self._input(ttk.Checkbutton(sound, text="Stereo sound",
-                                    variable=v["stereo"])).pack(side="left")
+        sound.grid(row=4, column=0, columnspan=3, sticky="w", pady=PADY)
+        self.for_video.append(self._input(ttk.Checkbutton(sound, text="Stereo sound",
+                                                          variable=v["stereo"])))
+        self.for_video[-1].pack(side="left")
         self._input(ttk.Checkbutton(sound, text="Hear the game while recording",
                                     variable=v["hear"])).pack(side="left", padx=(24, 0))
-        ttk.Label(sound, text="(the video has the sound either way)",
+        ttk.Label(sound, text="(the files have the sound either way)",
                   style="Note.TLabel").pack(side="left", padx=(6, 0))
         limit = ttk.Frame(video)
-        limit.grid(row=3, column=0, columnspan=3, sticky="w", pady=PADY)
+        limit.grid(row=5, column=0, columnspan=3, sticky="w", pady=PADY)
         self._input(ttk.Checkbutton(limit, text="Stop after",
                                     variable=v["time_limit"])).pack(side="left")
         self._input(ttk.Spinbox(limit, from_=10, to=RANGES["seconds"][1], increment=10, width=6,
@@ -336,10 +408,12 @@ class App:
         quality = ttk.Frame(more)
         quality.grid(row=4, column=0, columnspan=3, sticky="w", pady=PADY)
         ttk.Label(quality, text="Quality (lower is better)").pack(side="left")
-        self._input(ttk.Spinbox(quality, from_=0, to=51, width=4,
-                                textvariable=v["crf"])).pack(side="left", padx=(6, 24))
-        self._input(ttk.Checkbutton(quality, text="Keep the separate picture and sound files",
-                                    variable=v["keep"])).pack(side="left")
+        self.for_video += [
+            self._input(ttk.Spinbox(quality, from_=0, to=51, width=4, textvariable=v["crf"])),
+            self._input(ttk.Checkbutton(quality, text="Keep the separate picture and sound files",
+                                        variable=v["keep"]))]
+        self.for_video[-2].pack(side="left", padx=(6, 24))
+        self.for_video[-1].pack(side="left")
 
         box = self._box(main, 4, "Stella command (what the app runs; it can be copied)")
         box.columnconfigure(0, weight=1)
@@ -388,11 +462,13 @@ class App:
         return widget
 
     def _file_row(self, parent, row, text, key, browse):
+        """A label, a path field and its Browse button; returns the two inputs."""
         self._label(parent, row, text)
-        self._input(ttk.Entry(parent, textvariable=self.vars[key])).grid(
-            row=row, column=1, sticky="ew", pady=PADY)
-        self._input(ttk.Button(parent, text="Browse...", command=browse)).grid(
-            row=row, column=2, padx=(8, 0))
+        entry = self._input(ttk.Entry(parent, textvariable=self.vars[key]))
+        entry.grid(row=row, column=1, sticky="ew", pady=PADY)
+        button = self._input(ttk.Button(parent, text="Browse...", command=browse))
+        button.grid(row=row, column=2, padx=(8, 0))
+        return [entry, button]
 
     def _combo(self, parent, key, choices):
         return self._input(ttk.Combobox(parent, textvariable=self.vars[key], state="readonly",
@@ -440,6 +516,14 @@ class App:
             self.vars["video"].set(default_video(rom))
         self._last_rom = rom
 
+    def _video_changed(self, *_):
+        # And the capture follows the video the same way
+        video = self.vars["video"].get()
+        capture = self.vars["capture"].get()
+        if not capture.strip() or capture == default_capture(self._last_video):
+            self.vars["capture"].set(default_capture(video))
+        self._last_video = video
+
     def _changed(self, *_):
         self._update()
         if self._save_job:
@@ -459,6 +543,15 @@ class App:
         self._fit_command()
         if s["more"] != self._more_shown:
             self._show_more(s["more"])
+        if not self.job:
+            self._grey_unsaved(s["save"])
+
+    def _grey_unsaved(self, save):
+        """Grey the fields of the file that isn't saved (video or capture)."""
+        for widgets, used in ((self.for_video, save != "CAPTURE"),
+                              (self.for_capture, save != "VIDEO")):
+            for widget in widgets:
+                widget.state(["!disabled" if used else "disabled"])
 
     def _fit_command(self):
         """Make the command box as tall as its wrapped lines (2 to 8)."""
@@ -530,10 +623,15 @@ class App:
             return
         self.save()
         s = self.settings()
-        asked = video_path(s)
-        job = self.job = Job(video=free_name(asked), asked=asked)
+        asked = video_path(s) if s["save"] != "CAPTURE" else None
+        asked_capture = capture_path(s) if s["save"] != "VIDEO" else None
+        there = there_already(asked, asked_capture)
+        video, capture = free_names(asked, asked_capture)
+        job = self.job = Job(video=video, asked=asked, capture=capture,
+                             asked_capture=asked_capture, there=there)
         job.thread = threading.Thread(target=record_in_thread, args=(job.messages,), kwargs=dict(
-            rom=s["rom"].strip(), out_path=job.video, stella=s["stella"].strip() or self.found_stella,
+            rom=s["rom"].strip(), out_path=job.video, capture=job.capture,
+            stella=s["stella"].strip() or self.found_stella,
             stella_args=stella_options(s), sound=s["hear"], own_settings=self.own_settings,
             ffmpeg=s["ffmpeg"].strip() or "ffmpeg", stop=job.stop, finishing=job.finishing,
             scale=s["scale"], stereo=s["stereo"], crf=s["crf"], keep=s["keep"],
@@ -555,6 +653,8 @@ class App:
         """While recording, the fields can't change and only Stop works."""
         for widget in self.inputs + [self.record_button]:
             widget.state(["disabled" if recording else "!disabled"])
+        if not recording:
+            self._grey_unsaved(self.settings()["save"])
         self.stop_button.state(["!disabled" if recording else "disabled"])
         if recording:
             self.open_button.state(["disabled"])
@@ -563,9 +663,9 @@ class App:
     def _show_job(self):
         job = self.job
         if self.closing:
-            text = "Saving the video, then closing..."
+            text = f"Saving {job.what}, then closing..."
         elif job.finishing.is_set():
-            text = "Finishing the video..."
+            text = f"Finishing {job.what}..."
         elif job.stop.is_set():
             text = "Stopping: closing Stella..."
         elif job.progress:
@@ -604,15 +704,23 @@ class App:
             self.closing = False  # stay open to show why
             self._say(f"The recording failed. {error}")
             return
-        self.last_video = done.path
-        self.open_button.state(["!disabled"])
+        self.last_video = done.path  # the video, or the capture when there is none
+        if job.video:
+            self.open_button.state(["!disabled"])  # a capture has no player to open it in
         self.folder_button.state(["!disabled"])
+        saved = [p for p in (job.video, job.capture) if p]
+        asked = [p for p in (job.asked, job.asked_capture) if p]
         try:
-            size = f", {done.path.stat().st_size / 1e6:.1f} MB"
+            size = ", " + " and ".join(f"{p.stat().st_size / 1e6:.1f} MB" for p in saved)
         except OSError:
             size = ""
-        renamed = f" ({job.asked.name} was there already)" if done.path != job.asked else ""
-        self._say(f"Saved {done.path}{renamed}: {clock(done.seconds)}, "
+        names = f"{saved[0]} and {saved[1].name}" if len(saved) == 2 else str(saved[0])
+        renamed = ""
+        if saved != asked and job.there:
+            there = [p.name for p in job.there]
+            listed = ", ".join(there[:-1]) + " and " + there[-1] if len(there) > 1 else there[0]
+            renamed = f" ({listed} {'were' if len(there) > 1 else 'was'} there already)"
+        self._say(f"Saved {names}{renamed}: {clock(done.seconds)}, "
                   f"{done.frames:,} frames{size}.")
         if self.closing:
             self.close()
@@ -652,6 +760,15 @@ class App:
             filetypes=[("MP4 video", "*.mp4"), ("All files", "*")])
         if path:
             self.vars["video"].set(str(Path(path)))
+
+    def _browse_capture(self):
+        current = self.vars["capture"].get().strip()
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Save the capture as", initialdir=self._folder_of("capture"),
+            initialfile=Path(current).name if current else None, defaultextension=".sscap",
+            filetypes=[("StellaStream capture", "*.sscap"), ("All files", "*")])
+        if path:
+            self.vars["capture"].set(str(Path(path)))
 
     def _browse_program(self, key, title):
         types = [("Programs", "*.exe")] if sys.platform == "win32" else []
