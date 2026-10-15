@@ -73,6 +73,19 @@ class RecordRom(unittest.TestCase):
                  "-of", "csv=p=0", str(out)], capture_output=True, text=True).stdout.split()
             self.assertEqual(sorted(streams), ["aac", "h264,640,456"])
 
+    @unittest.skipUnless(shutil.which("ffprobe"), "needs ffprobe")
+    def test_sync_on_263_lines(self):
+        rom = testrom.write(BUILD / "stellastream_test_263.bin", lines=263)
+        for sync, rate in (("picture", "15720/263"), ("smooth", "60/1")):
+            out = BUILD / f"rom_263_{sync}.mp4"
+            result = record.record_rom(rom, out, sound=False, seconds=2, sync=sync, log=quiet)
+            self.assertEqual(result.frames, 120, sync)
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+                 "-show_entries", "stream=r_frame_rate,nb_read_packets", "-of", "csv=p=0",
+                 str(out)], capture_output=True, text=True).stdout.strip()
+            self.assertEqual(probe, f"{rate},120", sync)
+
     def test_stop_closes_stella_politely(self):
         stop = threading.Event()
         frames = []

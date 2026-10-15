@@ -1,6 +1,7 @@
 """A tiny 4K Atari 2600 test ROM, assembled here so the tests need no game.
 
-Every frame is 262 lines (3 VSYNC, 37 VBLANK, 192 shown, 30 overscan). Each
+Every frame is 262 lines (3 VSYNC, 37 VBLANK, 192 shown, 30 overscan), or
+another count from build(lines) and write(path, lines). Each
 frame adds 1 to RAM $80 and sets the background colour to it, so the picture
 and the RAM can be checked against each other. Channel 0 plays a steady tone
 (AUDC0 4, AUDF0 10, AUDV0 8); channel 1 is silent.
@@ -11,6 +12,7 @@ VSYNC, VBLANK, WSYNC, COLUBK = 0x00, 0x01, 0x02, 0x09
 AUDC0, AUDF0, AUDV0 = 0x15, 0x17, 0x19
 COUNTER = 0x80
 TONE_VOLUME = 8
+OVERSCAN_AT = 0x46  # the operand of F045 ldx #30
 
 # Hand-assembled 6502 at $F000; each line is one instruction
 PROGRAM = [
@@ -61,17 +63,22 @@ PROGRAM = [
 ]
 
 
-def build():
-    """The ROM image: 4096 bytes, reset and IRQ vectors pointing at $F000."""
+def build(lines=262):
+    """The ROM image: 4096 bytes, reset and IRQ vectors pointing at $F000;
+    frames of lines lines (233 to 487)."""
+    if not 233 <= lines <= 232 + 255:
+        raise ValueError(f"lines must be 233 to 487, not {lines}")
     rom = bytearray(4096)
     rom[:len(PROGRAM)] = bytes(PROGRAM)
+    assert rom[OVERSCAN_AT] == 30
+    rom[OVERSCAN_AT] = lines - 232
     rom[0xFFC:0x1000] = bytes([0x00, 0xF0, 0x00, 0xF0])
     return bytes(rom)
 
 
-def write(path):
+def write(path, lines=262):
     """Write the ROM to path (folders made as needed); returns the path."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(build())
+    path.write_bytes(build(lines))
     return path

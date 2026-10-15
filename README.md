@@ -67,12 +67,13 @@ Good to know:
 - The **Stella command** box shows exactly what the window runs, so you can
   see the option at work, or copy it.
 - **More options:** the Stella and ffmpeg programs, extra Stella options, the
-  video quality, and keeping the separate picture and sound files.
+  video quality, keeping the separate picture and sound files, and **Sync**
+  (see [Picture and sound together](#picture-and-sound-together)).
 - **Video or GIF from a capture:** choose a capture, type the part you want
   (**From** and **To**, in minutes:seconds; leave them empty for the start
   and the end) and press **Make video**. The video is named after the
-  capture (`game-clip.mp4`) and has the size, stereo sound and quality set
-  for recording. Name it `.gif` instead and the button becomes **Make GIF**
+  capture (`game-clip.mp4`) and has the size, stereo sound, quality and sync
+  set for recording. Name it `.gif` instead and the button becomes **Make GIF**
   (see [Animated GIFs](#animated-gifs)).
 - Every field is remembered, in `%APPDATA%\StellaStream\settings.json` on
   Windows and `~/.config/StellaStream/settings.json` elsewhere.
@@ -89,13 +90,38 @@ Options: `--scale 2` for 1280-wide video, `--stereo`, `--seconds 60` to stop
 after a minute, `--stella-args="-lc Driving"` for any other Stella options
 (here, a driving controller on the left port), `--ffmpeg <path>` if ffmpeg
 isn't on the PATH, `--capture game.sscap` to save a capture of the same play
-too. Ctrl+C also stops and finishes the video.
+too, `--sync picture` or `--sync sound` (see below). Ctrl+C also stops and
+finishes the video.
 
 Record from a stream saved earlier with `Stella -rawstream capture.raw game.bin`:
 
 ```
 python record.py capture.raw game.mp4
 ```
+
+## Picture and sound together
+
+Most games draw 262 lines a frame (312 on PAL), exactly 60 (50) frames a
+second, and for them every Sync choice gives the same video. A game that draws
+more or fewer lines runs at a slightly different rate, and a video has to give
+a little somewhere:
+
+- **Smooth** (the default): every picture once, at 60 a second (PAL: 50). The
+  sound is stretched or squeezed slightly to fit, eased over a quarter of a
+  second so the pitch stays steady. A 263-line game plays 0.4% fast, a
+  272-line one 3.8% (a little higher in pitch). Flicker looks right on a
+  normal 60 Hz screen.
+- **Picture**: every picture once, at the game's own rate (263 lines: 59.77
+  frames a second), so it plays at the real speed with every sound sample. If
+  the game's line count changes from frame to frame, each frame's sound is
+  cut or padded to fit, which can sound a little rough. A 60 Hz screen shows
+  some pictures twice while it plays such a video.
+- **Sound**: every sound sample at the real speed, at 60 frames a second; now
+  and then a picture is shown twice or left out to keep up (263 lines: one
+  every 4 seconds). That breaks a flicker effect for a frame.
+
+In every case each picture's sound stays under it, within a few milliseconds
+(Sound: within half a frame). GIFs aren't affected: they always run at 50.
 
 ## Capture files
 

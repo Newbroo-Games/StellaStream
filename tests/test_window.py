@@ -10,6 +10,8 @@ videos from a capture built here; it needs ffmpeg.
 import importlib.machinery
 import importlib.util
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -26,10 +28,10 @@ from tests.test_stream import run_of_frames
 APP_FILE = Path(__file__).resolve().parent.parent / "stellastream.pyw"
 
 
-def write_capture(path, frames=180):
+def write_capture(path, frames=180, lines=262):
     """A capture of the synthetic stream: frames NTSC frames (180: 3 s)."""
     with open(path, "wb") as f, sscap.Writer(f) as w:
-        w.write(run_of_frames(frames, 524))
+        w.write(run_of_frames(frames, 2 * lines, lines=lines))
     return path
 
 
@@ -79,7 +81,8 @@ class SettingsFile(unittest.TestCase):
 
     def test_round_trip(self):
         s = fields(rom="game.bin", left="DRIVING", format="PAL", scale=2, stereo=True,
-                   hear=False, time_limit=True, seconds=90, crf=18, extra="-tv.filter 1")
+                   hear=False, time_limit=True, seconds=90, crf=18, extra="-tv.filter 1",
+                   sync="PICTURE")
         app.save_settings(self.path, s)
         self.assertEqual(app.load_settings(self.path), s)
 
@@ -96,7 +99,8 @@ class SettingsFile(unittest.TestCase):
         self.path.parent.mkdir(parents=True)
         self.path.write_text(json.dumps({
             "rom": 5, "left": "NOT_A_CONTROLLER", "format": "ntsc", "scale": 3,
-            "hear": "yes", "seconds": 0, "crf": True, "stereo": True, "unknown": 1}),
+            "hear": "yes", "seconds": 0, "crf": True, "stereo": True, "unknown": 1,
+            "sync": "fast"}),
             encoding="utf-8")
         self.assertEqual(app.load_settings(self.path), fields(stereo=True))
 
@@ -352,6 +356,16 @@ class Window(unittest.TestCase):
         s = self.window.settings()
         self.assertEqual((s["seconds"], s["crf"]), (45, 12))
 
+    def test_sync_choice_and_its_note(self):
+        w, v = self.window, self.window.vars
+        self.assertEqual((v["sync"].get(), w.settings()["sync"]), ("Smooth", "SMOOTH"))
+        self.assertIn("at 60 a second", w.sync_note.get())
+        v["sync"].set("Picture")
+        self.assertEqual(w.settings()["sync"], "PICTURE")
+        self.assertIn("the game's own speed", w.sync_note.get())
+        v["sync"].set("Sound")
+        self.assertIn("Every sound sample", w.sync_note.get())
+
     def test_more_options_fold(self):
         v = self.window.vars
         self.assertFalse(self.window.more.winfo_manager())
@@ -584,6 +598,19 @@ class WindowMakesVideos(RunningWindow):
         self.run_window(lambda: w.job is None)
         self.assertIn("00:03, 180 frames", w.status.get())
         self.assertNotIn("Clip from", w.note.get())
+
+    @unittest.skipUnless(shutil.which("ffprobe"), "needs ffprobe")
+    def test_sync_reaches_the_video(self):
+        w, v = self.window, self.window.vars
+        v["clip_capture"].set(str(write_capture(BUILD / "window_263.sscap", 120, lines=263)))
+        v["sync"].set("Picture")
+        w.make_button.invoke()
+        self.run_window(lambda: w.job is None)
+        self.assertIn("59.7719 fps, sync picture", w.note.get())
+        rate = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                               "stream=r_frame_rate", "-of", "csv=p=0", str(w.last_video)],
+                              capture_output=True, text=True).stdout.strip()
+        self.assertEqual(rate, "15720/263")
 
     def test_a_failure_says_so(self):
         w = self.window

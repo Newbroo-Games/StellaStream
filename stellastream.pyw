@@ -40,13 +40,21 @@ CONTROLLERS = [
 TV_FORMATS = [("Auto", "AUTO"), ("NTSC", "NTSC"), ("PAL", "PAL"), ("SECAM", "SECAM"),
               ("NTSC50", "NTSC50"), ("PAL60", "PAL60"), ("SECAM60", "SECAM60")]
 SAVE_MODES = [("Video", "VIDEO"), ("Capture", "CAPTURE"), ("Both", "BOTH")]
-CHOICES = {"left": CONTROLLERS, "right": CONTROLLERS, "format": TV_FORMATS, "save": SAVE_MODES}
+SYNC_MODES = [(name.capitalize(), name.upper()) for name in record.SYNCS]
+SYNC_NOTES = {  # under the Sync choice: what it does
+    "SMOOTH": "Every picture, at 60 a second (PAL: 50); the sound a little faster or slower to fit.",
+    "PICTURE": "Every picture, at the game's own speed; the sound cut or padded to fit.",
+    "SOUND": "Every sound sample; now and then a picture shown twice or left out.",
+}
+CHOICES = {"left": CONTROLLERS, "right": CONTROLLERS, "format": TV_FORMATS, "save": SAVE_MODES,
+           "sync": SYNC_MODES}
 
 DEFAULTS = {
     "rom": "", "left": "AUTO", "right": "AUTO", "format": "AUTO",
     "save": "VIDEO", "video": "", "capture": "", "scale": 1, "stereo": False, "hear": True,
     "time_limit": False, "seconds": 60,
     "more": False, "stella": "", "ffmpeg": "ffmpeg", "extra": "", "crf": 12, "keep": False,
+    "sync": record.SYNCS[0].upper(),
     "clip": False, "clip_capture": "", "clip_from": "", "clip_to": "", "clip_video": "",
 }
 RANGES = {"scale": (1, 2), "seconds": (1, 24 * 3600), "crf": (0, 51)}
@@ -517,6 +525,18 @@ class App:
                                         variable=v["keep"]))]
         self.for_video[-2].pack(side="left", padx=(6, 24))
         self.for_video[-1].pack(side="left")
+        self._label(more, 5, "Sync")
+        syncs = ttk.Frame(more)
+        syncs.grid(row=5, column=1, columnspan=2, sticky="w", pady=(PADY, 0))
+        for i, (shown, _) in enumerate(SYNC_MODES):
+            self.for_video.append(self._input(ttk.Radiobutton(
+                syncs, text=shown, variable=v["sync"], value=shown)))
+            self.for_video[-1].pack(side="left", padx=(0 if i == 0 else 16, 0))
+        ttk.Label(syncs, text="(for games whose frames aren't 262 lines; PAL: 312)",
+                  style="Note.TLabel").pack(side="left", padx=(16, 0))
+        self.sync_note = tk.StringVar()
+        ttk.Label(more, textvariable=self.sync_note, style="Note.TLabel").grid(
+            row=6, column=1, columnspan=2, sticky="w", pady=(0, PADY))
 
         box = self._box(main, 4, "Stella command (what the app runs; it can be copied)")
         box.columnconfigure(0, weight=1)
@@ -683,7 +703,7 @@ class App:
                                "50 frames a second, no sound)")
         else:
             self.make_button.configure(text="Make video")
-            self.make_note.set("(size, stereo sound and quality: as for recording; "
+            self.make_note.set("(size, stereo sound, quality and sync: as for recording; "
                                "name it .gif for an animated GIF)")
         self.root.after_idle(self._fit_window)
 
@@ -704,6 +724,7 @@ class App:
         self.command.insert("1.0", text)
         self.command.configure(state="disabled")
         self._fit_command()
+        self.sync_note.set(SYNC_NOTES[s["sync"]])
         for key in self._folds:
             if s[key] != self._fold_shown.get(key):
                 self._show_fold(key, s[key])
@@ -828,7 +849,7 @@ class App:
         job.thread = threading.Thread(target=work_in_thread, args=(job.messages, work), kwargs=dict(
             kwargs, ffmpeg=s["ffmpeg"].strip() or "ffmpeg", stop=job.stop,
             finishing=job.finishing, scale=s["scale"], stereo=s["stereo"], crf=s["crf"],
-            keep=s["keep"]))
+            keep=s["keep"], sync=s["sync"].lower()))
         self._lock(True)
         self.note.set("")
         self._show_job()

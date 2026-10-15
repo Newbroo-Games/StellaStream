@@ -12,10 +12,20 @@ to the TV shape (4x wide, 2x tall; --scale 2 doubles that), at 60 fps (NTSC)
 or 50 fps (PAL). Sound: Stella's own mix (mono, or --stereo) with the same
 10 Hz high-pass Stella plays it through, encoded as AAC.
 
-The sound is the clock: each frame is written as many times as the sound says
-is due (once, normally), so a game whose frames aren't exactly 262 lines stays
-in sync. Video goes to ffmpeg as it arrives, sound to a WAV file; the two are
-joined at the end without re-encoding the picture.
+--sync: how picture and sound stay together on a game whose frames aren't
+262 lines (312 for PAL). On one that is, all three give the same video.
+  smooth   (the default) every picture once at 60 (50) fps; the sound is
+           stretched to fit, eased over 15 frames each side, so a 263-line
+           game plays 0.4% fast and a 272-line one 3.8% (a little higher).
+  picture  every picture once at the game's own rate, the average frame
+           length of the first second (263 lines: 59.77 fps); each frame's
+           sound cut or padded to fit. Real speed; on a game whose frame
+           length changes, the sound can sound a little rough.
+  sound    every sample at the real speed; a picture is shown twice or left
+           out now and then to keep up (263 lines: one every 4 s), which
+           breaks a flicker kernel's alternation for a frame.
+Video goes to ffmpeg as it arrives, sound to a WAV file; the two are joined
+at the end without re-encoding the picture.
 
 A name ending in .gif makes an animated GIF instead (gif.py): Stella's exact
 colors, 640 wide, 50 frames a second, no sound, no ffmpeg. From a capture or
@@ -34,6 +44,7 @@ import threading
 import time
 import wave
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 import gif
@@ -43,6 +54,9 @@ from sscap import Capture, CaptureError, Writer, is_capture, time_option, time_t
 
 TV_SHAPE = (4, 2)  # a TIA pixel is about twice as wide as a scanline is tall
 PROGRESS_EVERY = 0.2  # seconds between progress calls
+SYNCS = ("smooth", "picture", "sound")  # the --sync choices; the first is the default
+EASE = 15         # smooth: the frames on each side a frame's sound is eased over
+RATE_FRAMES = 60  # picture: the frames whose average length sets the rate
 
 
 class RecordError(Exception):
@@ -96,10 +110,145 @@ def check_ffmpeg(ffmpeg="ffmpeg"):
 
 
 def side_files(out_path):
-    """The separate picture and sound files record() writes next to the video."""
+    """The separate picture and sound files record() writes next to the video.
+    The picture goes in a fragmented MP4, which keeps every frame's exact time
+    (Matroska rounds them to milliseconds) and can be read if it is cut off."""
     out_path = Path(out_path)
-    return (out_path.with_name(out_path.stem + ".video.mkv"),
+    return (out_path.with_name(out_path.stem + ".video.mp4"),
             out_path.with_name(out_path.stem + ".audio.wav"))
+
+
+class _SoundSync:
+    """sync "sound": the sound is the clock. Every sample is kept; each picture
+    is written as many times as the samples say is due at the nominal rate,
+    counted to the nearest frame, so a picture is at most half a frame from
+    its sound (once, normally; now and then 0 or 2 times on frames shorter or
+    longer than 262 lines).
+
+    Each sync class takes the frames in order with frame(picture, sound,
+    lines) and returns what is ready: ([(picture, times)], sound bytes);
+    finish() returns the rest. fps is the video's rate (None until known);
+    pictures counts the pictures given out or waiting.
+    """
+
+    def __init__(self, header):
+        self.per_frame = header.samples_per_frame
+        self.fps = Fraction(header.sample_rate, self.per_frame)
+        self.samples = 0
+        self.pictures = 0
+
+    def frame(self, picture, sound, lines):
+        self.samples += len(sound)
+        nearest = (2 * self.samples + self.per_frame) // (2 * self.per_frame)
+        due = max(nearest - self.pictures, 0)
+        self.pictures += due
+        return [(picture, due)], sound
+
+    def finish(self):
+        return [], b""
+
+
+class _PictureSync:
+    """sync "picture": every picture once, at the rate of the average frame
+    length of the first RATE_FRAMES frames (kept back until then); each
+    frame's sound cut, or padded by holding its last sample, to its share of
+    that rate. Real speed, and every sample kept when the length is steady."""
+
+    def __init__(self, header):
+        self.sample_rate = header.sample_rate
+        self.fps = None
+        self.waiting = []  # (picture, sound, lines) until the rate is set
+        self.done = 0      # frames given out
+        self.pictures = 0
+
+    def _fit(self, picture, sound):
+        k = self.done
+        self.done += 1
+        slot = round((k + 1) * self.per_frame) - round(k * self.per_frame)
+        if len(sound) >= slot:
+            return sound[:slot]
+        return sound + (sound[-1:] or b"\0") * (slot - len(sound))
+
+    def _set_rate(self):
+        lines = sum(w[2] for w in self.waiting)
+        self.per_frame = Fraction(2 * max(lines, 1), len(self.waiting))
+        self.fps = self.sample_rate / self.per_frame
+        waiting, self.waiting = self.waiting, []
+        return ([(picture, 1) for picture, _, _ in waiting],
+                b"".join(self._fit(picture, sound) for picture, sound, _ in waiting))
+
+    def frame(self, picture, sound, lines):
+        self.pictures += 1
+        if self.fps is None:
+            self.waiting.append((picture, sound, lines))
+            return self._set_rate() if len(self.waiting) == RATE_FRAMES else ([], b"")
+        return [(picture, 1)], self._fit(picture, sound)
+
+    def finish(self):
+        return self._set_rate() if self.waiting else ([], b"")
+
+
+class _SmoothSync:
+    """sync "smooth": every picture once at the nominal rate (60 NTSC, 50
+    PAL); each frame gets a nominal frame of sound, read (the nearest sample)
+    from between its start and the next frame's, both averaged over EASE
+    frames each side, so the pitch doesn't wobble when the frame length
+    changes and each picture's sound stays under it. Frames of the nominal
+    length keep their samples as they are. The sound is given out EASE
+    frames behind the pictures."""
+
+    def __init__(self, header):
+        self.per_frame = header.samples_per_frame
+        self.fps = Fraction(header.sample_rate, self.per_frame)
+        self.starts = [0]  # where frames self.first, ... start in the sound, then its end
+        self.first = 0
+        self.sound = bytearray()  # the sound from sample self.base on
+        self.base = 0
+        self.done = 0      # frames whose sound has been given out
+        self.pictures = 0
+
+    def _eased(self, k):
+        frames = self.first + len(self.starts) - 1
+        m = min(EASE, k, frames - k)
+        i = k - self.first
+        return sum(self.starts[i - m:i + m + 1]) / (2 * m + 1)
+
+    def _give(self, ready):
+        """Sound for the frames from self.done while their averages are final."""
+        out = bytearray()
+        while self.done < ready:
+            a, b = self._eased(self.done), self._eased(self.done + 1)
+            per, base = self.per_frame, self.base
+            if a == int(a) and b - a == per:
+                out += self.sound[int(a) - base:int(b) - base]
+            else:
+                step, last = (b - a) / per, len(self.sound) - 1
+                buf = self.sound
+                out += bytes(buf[min(max(int(a + t * step) - base, 0), last)]
+                             for t in range(per))
+            self.done += 1
+            cut = int(self._eased(self.done)) - self.base
+            if cut > 0:
+                del self.sound[:cut]
+                self.base += cut
+            if self.done - EASE - self.first > 1000:
+                drop = self.done - EASE - self.first
+                del self.starts[:drop]
+                self.first += drop
+        return bytes(out)
+
+    def frame(self, picture, sound, lines):
+        self.pictures += 1
+        self.sound += sound
+        self.starts.append(self.starts[-1] + len(sound))
+        frames = self.first + len(self.starts) - 1
+        return [(picture, 1)], self._give(frames - EASE)
+
+    def finish(self):
+        return [], self._give(self.first + len(self.starts) - 1)
+
+
+SYNC_METHODS = {"smooth": _SmoothSync, "picture": _PictureSync, "sound": _SoundSync}
 
 
 def is_gif(path):
@@ -114,30 +263,36 @@ def _ffmpeg_failed(what, said):
 
 
 def record(stream, out_path, scale=1, stereo=False, seconds=None, crf=12, keep=False,
-           ffmpeg="ffmpeg", progress=None, stop=None, started=None, finishing=None, log=_log):
+           sync=SYNCS[0], ffmpeg="ffmpeg", progress=None, stop=None, started=None,
+           finishing=None, log=_log):
     """Turn a raw stream into a video at out_path. Returns a Result.
 
-    progress(frames, seconds, bytes): called about 5 times a second with the
-    video so far. stop: a threading.Event; once set, recording ends at the
-    next chunk. started: a threading.Event, set when the first HEAD arrives.
-    finishing: a threading.Event, set when the stream is over and the video
-    is being finished. log(message): short notes for the user. Raises
-    RecordError. An out_path ending in .gif makes a GIF (record_gif()), and
-    the options for the video and the sound don't apply.
+    sync: one of SYNCS, how picture and sound are kept together (the module's
+    notes). progress(frames, seconds, bytes): called about 5 times a second
+    with the video so far. stop: a threading.Event; once set, recording ends
+    at the next chunk. started: a threading.Event, set when the first HEAD
+    arrives. finishing: a threading.Event, set when the stream is over and
+    the video is being finished. log(message): short notes for the user.
+    Raises RecordError. An out_path ending in .gif makes a GIF
+    (record_gif()), and the options for the video and the sound don't apply.
     """
     if is_gif(out_path):
         return record_gif(stream, out_path, seconds=seconds, progress=progress, stop=stop,
                           started=started, finishing=finishing, log=log)
+    if sync not in SYNCS:
+        raise ValueError(f"sync must be one of {', '.join(SYNCS)}, not {sync!r}")
     out_path = Path(out_path)
     video_path, audio_path = side_files(out_path)
 
     header = None
+    timing = None   # the sync method (SYNC_METHODS)
     pcm_tables = None
     planes = None   # (G, B, R) translate tables; ffmpeg's gbrp order
     height = None   # fixed at the first frame
     encoder = None
     wav = None
-    samples = 0
+    pending = bytearray()  # the sound sent since the last frame
+    first = True
     pcm_bytes = 0
     frames_out = 0
     end_seen = False
@@ -146,86 +301,114 @@ def record(stream, out_path, scale=1, stereo=False, seconds=None, crf=12, keep=F
     blank_row = bytes(160)
     next_progress = 0.0
 
+    def video_fps():
+        # picture's rate is set after its first second; the nominal one until then
+        return timing.fps or Fraction(header.sample_rate, header.samples_per_frame)
+
     def report_progress():
-        if not progress or header is None:
+        if not progress or timing is None:
             return
         try:
             video_bytes = video_path.stat().st_size
         except OSError:
             video_bytes = 0
-        progress(frames_out, frames_out * header.samples_per_frame / header.sample_rate,
-                 video_bytes + pcm_bytes)
+        progress(timing.pictures, float(timing.pictures / video_fps()), video_bytes + pcm_bytes)
+
+    def start_encoder():
+        nonlocal encoder
+        fps = timing.fps
+        sx, sy = TV_SHAPE[0] * scale, TV_SHAPE[1] * scale
+        try:
+            encoder = subprocess.Popen(
+                [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                 "-f", "rawvideo", "-pix_fmt", "gbrp", "-s", f"160x{height}",
+                 "-r", f"{fps.numerator}/{fps.denominator}", "-i", "-",
+                 "-vf", f"scale=iw*{sx}:ih*{sy}:flags=neighbor",
+                 "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
+                 "-pix_fmt", "yuv420p", "-movflags", "+frag_keyframe+empty_moov",
+                 str(video_path)],
+                stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError as e:
+            raise RecordError(f"ffmpeg doesn't run ('{ffmpeg}'): {e}") from None
+        log(f"Picture 160x{height} -> {160 * sx}x{height * sy}, "
+            f"{float(fps):.6g} fps, sync {sync}")
+
+    def write(ready, sound):
+        # OSError: the encoder is gone
+        nonlocal frames_out, pcm_bytes
+        if ready and encoder is None:
+            start_encoder()
+        for picture, times in ready:
+            for _ in range(times):
+                encoder.stdin.write(picture)
+            frames_out += times
+        if sound:
+            pcm = to_pcm(sound, pcm_tables)
+            wav.writeframesraw(pcm)
+            pcm_bytes += len(pcm)
 
     try:
-        for item in parse(stream):
-            if stop is not None and stop.is_set():
-                break
-            if isinstance(item, Header):
-                if header and item.timing != header.timing:
-                    log(f"The TV type changed to {item.timing_name}; the video stops there.")
+        try:
+            for item in parse(stream):
+                if stop is not None and stop.is_set():
                     break
-                if header is None:
-                    header = item
-                    if started is not None:
-                        started.set()
-                    pcm_tables = audio_tables(header, stereo)
-                    wav = wave.open(str(audio_path), "wb")
-                    wav.setnchannels(2 if stereo else 1)
-                    wav.setsampwidth(2)
-                    wav.setframerate(header.sample_rate)
-                    log(f"{header.timing_name}, ROM '{header.rom_name}'")
-            elif isinstance(item, Palette):
-                rgb = item.rgb
-                planes = tuple(bytes(rgb[i * 3 + c] for i in range(256)) for c in (1, 2, 0))
-            elif isinstance(item, Audio):
-                if wav:
-                    pcm = to_pcm(item.samples, pcm_tables)
-                    wav.writeframesraw(pcm)
-                    samples += len(item.samples)
-                    pcm_bytes += len(pcm)
-            elif isinstance(item, Frame):
-                if header is None or planes is None:
-                    continue
-                if encoder is None:
-                    height = item.height
-                    fps = f"{header.sample_rate}/{header.samples_per_frame}"
-                    sx, sy = TV_SHAPE[0] * scale, TV_SHAPE[1] * scale
+                if isinstance(item, Header):
+                    if header and item.timing != header.timing:
+                        log(f"The TV type changed to {item.timing_name}; the video stops there.")
+                        break
+                    if header is None:
+                        header = item
+                        if started is not None:
+                            started.set()
+                        timing = SYNC_METHODS[sync](header)
+                        pcm_tables = audio_tables(header, stereo)
+                        wav = wave.open(str(audio_path), "wb")
+                        wav.setnchannels(2 if stereo else 1)
+                        wav.setsampwidth(2)
+                        wav.setframerate(header.sample_rate)
+                        log(f"{header.timing_name}, ROM '{header.rom_name}'")
+                elif isinstance(item, Palette):
+                    rgb = item.rgb
+                    planes = tuple(bytes(rgb[i * 3 + c] for i in range(256)) for c in (1, 2, 0))
+                elif isinstance(item, Audio):
+                    if wav:
+                        pending += item.samples
+                elif isinstance(item, Frame):
+                    sound = bytes(pending)
+                    pending.clear()
+                    if header is None or planes is None:
+                        continue
+                    if first:
+                        first = False
+                        if len(sound) != 2 * item.scanlines:
+                            continue  # cut into by the stream's start: no picture, no sound
+                    if height is None:
+                        height = item.height
+                    px = item.pixels[:160 * height]
+                    if item.height < height:
+                        px += blank_row * (height - item.height)
+                    picture = b"".join(px.translate(t) for t in planes)
                     try:
-                        encoder = subprocess.Popen(
-                            [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-                             "-f", "rawvideo", "-pix_fmt", "gbrp", "-s", f"160x{height}",
-                             "-r", fps, "-i", "-",
-                             "-vf", f"scale=iw*{sx}:ih*{sy}:flags=neighbor",
-                             "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
-                             "-pix_fmt", "yuv420p", str(video_path)],
-                            stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-                    except OSError as e:
-                        raise RecordError(f"ffmpeg doesn't run ('{ffmpeg}'): {e}") from None
-                    log(f"Picture 160x{height} -> {160 * sx}x{height * sy}, "
-                        f"{header.sample_rate / header.samples_per_frame:g} fps")
-                px = item.pixels[:160 * height]
-                if item.height < height:
-                    px += blank_row * (height - item.height)
-                frame = b"".join(px.translate(t) for t in planes)
-                due = samples // header.samples_per_frame - frames_out
-                try:
-                    for _ in range(due):
-                        encoder.stdin.write(frame)
-                except OSError:
-                    encoder_failed = True
-                    break
-                frames_out += max(due, 0)
-                if time.monotonic() >= next_progress:
-                    report_progress()
-                    next_progress = time.monotonic() + PROGRESS_EVERY
-                if seconds and frames_out >= seconds * header.sample_rate / header.samples_per_frame:
-                    break
-            elif isinstance(item, End):
-                end_seen = True
-            elif isinstance(item, Jump):
-                pass  # a jump is just a cut in the video
-    except KeyboardInterrupt:
-        log("Stopped")
+                        write(*timing.frame(picture, sound, item.scanlines))
+                    except OSError:
+                        encoder_failed = True
+                        break
+                    if time.monotonic() >= next_progress:
+                        report_progress()
+                        next_progress = time.monotonic() + PROGRESS_EVERY
+                    if seconds and timing.pictures >= seconds * video_fps():
+                        break
+                elif isinstance(item, End):
+                    end_seen = True
+                elif isinstance(item, Jump):
+                    pass  # a jump is just a cut in the video
+        except KeyboardInterrupt:
+            log("Stopped")
+        if timing and not encoder_failed:
+            try:
+                write(*timing.finish())
+            except OSError:
+                encoder_failed = True
     finally:
         if finishing is not None:
             finishing.set()
@@ -260,16 +443,17 @@ def record(stream, out_path, scale=1, stereo=False, seconds=None, crf=12, keep=F
     if not keep:
         video_path.unlink()
         audio_path.unlink()
-    return Result(out_path, frames_out,
-                  frames_out * header.samples_per_frame / header.sample_rate, end_seen)
+    return Result(out_path, frames_out, float(frames_out / timing.fps), end_seen)
 
 
 def record_gif(stream, out_path, seconds=None, progress=None, stop=None, started=None,
                finishing=None, log=_log):
     """Turn a raw stream into an animated GIF at out_path (gif.py), with no
     sound and no ffmpeg. Returns a Result (frames: the GIF's, gif.FPS a
-    second). The sound is the clock, as in record(): each GIF frame shows the
-    frame on the TV at its time. seconds, progress (bytes: the GIF's so far),
+    second). The sound is the clock, as in record()'s sync "sound": each GIF
+    frame shows the frame on the TV at its time (a GIF's delays are whole
+    hundredths of a second, so the sync choices don't apply). seconds,
+    progress (bytes: the GIF's so far),
     stop, started, finishing and log work as in record(). Raises RecordError.
     """
     out_path = Path(out_path)
@@ -470,7 +654,7 @@ def record_rom(rom, out_path=None, *, capture=None, stella=None, stella_args=(),
     set, which asks Stella to close, or after video['seconds']. sound: Stella
     plays the game's sound (the files get it either way). own_settings: Stella
     uses a settings folder of its own (default: when silent, as for tests).
-    video: record()'s scale, stereo, seconds, crf, keep and finishing. A
+    video: record()'s scale, stereo, seconds, crf, keep, sync and finishing. A
     capture alone needs no ffmpeg. Raises RecordError.
     """
     rom = Path(rom)
@@ -585,6 +769,12 @@ def main():
     ap.add_argument("--seconds", type=float, help="stop after this much emulated time")
     ap.add_argument("--crf", type=int, default=12, help="x264 quality, lower is better (12)")
     ap.add_argument("--keep", action="store_true", help="keep the separate video and WAV files")
+    ap.add_argument("--sync", choices=SYNCS, default=SYNCS[0],
+                    help="how picture and sound stay together when a game's frames aren't "
+                         "262 (312) lines: smooth (every picture, the sound stretched a "
+                         "little), picture (every picture at the game's own rate) or sound "
+                         "(every sample; a picture now and then repeated or left out). "
+                         "Default smooth; not for a GIF")
     ap.add_argument("--silent", action="store_true",
                     help="with --rom: no sound from Stella, and its own settings folder")
     ap.add_argument("--stella", help="the Stella to run (default: found automatically)")
@@ -614,7 +804,7 @@ def main():
             ap.error("a GIF is always the TV shape at --scale 1 (640 wide)")
 
     video = dict(scale=args.scale, stereo=args.stereo, seconds=args.seconds,
-                 crf=args.crf, keep=args.keep)
+                 crf=args.crf, keep=args.keep, sync=args.sync)
     progress = _cli_progress()
     try:
         if args.source and is_capture(args.source):
