@@ -2,7 +2,8 @@
 options the fields make, the checks before recording, and the window itself,
 built hidden on a settings file of its own and closed again. No dialog opens.
 WindowRecords records the test ROM from the window, with Stella silent on the
-app's own settings folder; it needs Stella and ffmpeg.
+app's own settings folder; it needs Stella and ffmpeg. WindowMakesVideos makes
+videos from a capture built here; it needs ffmpeg.
 
     python -m unittest discover -s tests -t .
 """
@@ -17,10 +18,19 @@ import unittest
 from pathlib import Path
 
 import rawstream
+import sscap
 from tests import testrom
 from tests.test_stella import BUILD, HAVE_FFMPEG, HAVE_STELLA, ROM
+from tests.test_stream import run_of_frames
 
 APP_FILE = Path(__file__).resolve().parent.parent / "stellastream.pyw"
+
+
+def write_capture(path, frames=180):
+    """A capture of the synthetic stream: frames NTSC frames (180: 3 s)."""
+    with open(path, "wb") as f, sscap.Writer(f) as w:
+        w.write(run_of_frames(frames, 524))
+    return path
 
 
 def load_app():
@@ -189,6 +199,7 @@ class BeforeRecording(unittest.TestCase):
                 (dict(rom=str(self.folder / "gone.bin")), "ROM file isn't there"),
                 (dict(video=" "), "Choose where to save the video"),
                 (dict(video="game.avi"), "must end in .mp4"),
+                (dict(video="game.gif"), "A GIF is made from a capture: save a Capture"),
                 (dict(stella=str(self.folder / "no_stella.exe")), "Stella isn't there"),
                 (dict(extra='-x "open'), "a quote isn't closed")):
             s = fields(**dict(good, **changes))
@@ -210,6 +221,47 @@ class BeforeRecording(unittest.TestCase):
         self.assertIsNone(app.check_fields(fields(**dict(good, save="VIDEO", video="game.mp4",
                                                          capture="game.cap"))),
                           "a capture that isn't saved isn't checked")
+
+    def test_video_from_a_capture(self):
+        capture = write_capture(self.folder / "game.sscap")
+        self.assertEqual(app.default_clip_video(str(Path("caps") / "game.sscap")),
+                         str(Path("caps") / "game-clip.mp4"))
+        self.assertEqual(app.default_clip_video(str(Path("caps") / "game.sscap"), ".gif"),
+                         str(Path("caps") / "game-clip.gif"))
+        self.assertEqual(app.default_clip_video(" "), "")
+        self.assertEqual(app.clip_video_path(fields(clip_capture=str(capture),
+                                                    clip_video="mine.mp4")),
+                         self.folder / "mine.mp4", "a bare name goes next to the capture")
+        self.assertEqual(app.capture_note(str(capture)), "0:03.00 long, 180 frames")
+        self.assertEqual(app.capture_note(str(self.folder / "gone.sscap")), "")
+        self.assertTrue(app.capture_note(str(self.rom)).startswith(
+            "Can't read it: not a StellaStream capture"))
+
+    def test_clip_times(self):
+        for start, end, times in (("", "", (0.0, None)), ("1:20", "1:45", (80, 105)),
+                                  (" 2.5 ", "", (2.5, None)), ("", "3", (0.0, 3))):
+            self.assertEqual(app.clip_times(fields(clip_from=start, clip_to=end)), times)
+        for start, end, message in (("x", "", "From: give a time"), ("", "1:99", "To: give a time"),
+                                    ("1:20", "1:20", "To must be after From")):
+            with self.assertRaisesRegex(ValueError, message):
+                app.clip_times(fields(clip_from=start, clip_to=end))
+
+    def test_each_clip_problem_says_what_to_fix(self):
+        capture = write_capture(self.folder / "game.sscap")
+        good = dict(clip_capture=str(capture), clip_video=str(self.folder / "out" / "clip.mp4"))
+        for changes, message in (
+                (dict(clip_capture=""), "Choose the capture"),
+                (dict(clip_capture=str(self.folder / "gone.sscap")), "capture file isn't there"),
+                (dict(clip_capture=str(self.rom)), "Can't read the capture"),
+                (dict(clip_from="x"), "From: give a time"),
+                (dict(clip_from="3"), "at or after the capture's end (0:03.00)"),
+                (dict(clip_from="2", clip_to="1"), "To must be after From"),
+                (dict(clip_video=" "), "Choose where to save the video"),
+                (dict(clip_video="clip.avi"), "must end in .mp4")):
+            self.assertIn(message, app.check_clip_fields(fields(**dict(good, **changes))), changes)
+        self.assertIsNone(app.check_clip_fields(fields(**good)))
+        self.assertTrue((self.folder / "out").is_dir(), "the video's folder is made")
+        self.assertIsNone(app.check_clip_fields(fields(**dict(good, clip_video="clip.GIF"))))
 
     def test_clock(self):
         self.assertEqual((app.clock(42.9), app.clock(600), app.clock(3723)),
@@ -288,6 +340,7 @@ class Window(unittest.TestCase):
         w.vars["save"].set("Video")
         w._lock(True)
         self.assertTrue(all(greyed(w.for_video + w.for_capture)), "all locked while recording")
+        self.assertTrue(w.make_button.instate(["disabled"]))
         w._lock(False)
         self.assertTrue(all(greyed(w.for_capture)) and not any(greyed(w.for_video)))
 
@@ -308,6 +361,38 @@ class Window(unittest.TestCase):
         self.window.fold.invoke()
         self.assertFalse(v["more"].get())
         self.assertFalse(self.window.more.winfo_manager())
+
+    def test_video_from_a_capture_fold(self):
+        w = self.window
+        self.assertFalse(w.clip_box.winfo_manager())
+        self.assertEqual(w.clip_fold.cget("text"), "▸ Video or GIF from a capture")
+        w.clip_fold.invoke()
+        self.assertEqual(w.clip_box.winfo_manager(), "grid")
+        self.assertEqual(w.clip_fold.cget("text"), "▾ Video or GIF from a capture")
+
+    def test_clip_video_follows_the_capture_until_named(self):
+        v = self.window.vars
+        v["clip_capture"].set(str(Path("caps") / "one.sscap"))
+        self.assertEqual(v["clip_video"].get(), str(Path("caps") / "one-clip.mp4"))
+        v["clip_video"].set(str(Path("caps") / "one-clip.gif"))
+        v["clip_capture"].set(str(Path("caps") / "two.sscap"))
+        self.assertEqual(v["clip_video"].get(), str(Path("caps") / "two-clip.gif"), "still a GIF")
+        v["clip_video"].set("mine.mp4")
+        v["clip_capture"].set(str(Path("caps") / "three.sscap"))
+        self.assertEqual(v["clip_video"].get(), "mine.mp4")
+
+    def test_the_button_says_video_or_gif(self):
+        w = self.window
+        self.assertEqual(w.make_button.cget("text"), "Make video")
+        self.assertIn("name it .gif for an animated GIF", w.make_note.get())
+        w.vars["clip_video"].set("clip.gif")
+        self.assertEqual(w.make_button.cget("text"), "Make GIF")
+        self.assertIn("640 wide, 50 frames a second, no sound", w.make_note.get())
+
+    def test_make_video_says_what_to_fix_and_starts_nothing(self):
+        self.window.make_button.invoke()
+        self.assertEqual(self.window.status.get(), "Choose the capture to make a video or GIF from.")
+        self.assertIsNone(self.window.job)
 
     def test_closing_saves_and_a_new_window_remembers(self):
         v = self.window.vars
@@ -342,14 +427,8 @@ class Window(unittest.TestCase):
         self.assertFalse(self.window.inputs[0].instate(["disabled"]))
 
 
-@unittest.skipUnless(HAVE_STELLA and HAVE_FFMPEG, "needs a Stella with -rawstream and ffmpeg")
-class WindowRecords(unittest.TestCase):
-    """Record the test ROM from the window, as a user would, but silently and
-    on the app's own Stella settings."""
-
-    @classmethod
-    def setUpClass(cls):
-        testrom.write(ROM)
+class RunningWindow(unittest.TestCase):
+    """A window that runs jobs: setUp() makes it (self.root, self.window)."""
 
     def setUp(self):
         for old in BUILD.glob("window*.*"):
@@ -358,11 +437,6 @@ class WindowRecords(unittest.TestCase):
         self.root.withdraw()
         self.dir = tempfile.TemporaryDirectory()
         self.window = app.App(self.root, settings_file=Path(self.dir.name) / "settings.json")
-        self.window.own_settings = True
-        v = self.window.vars
-        v["rom"].set(str(ROM))
-        v["video"].set(str(BUILD / "window.mp4"))
-        v["hear"].set(False)
 
     def tearDown(self):
         job = self.window.job
@@ -383,6 +457,24 @@ class WindowRecords(unittest.TestCase):
                 return False
             time.sleep(0.02)
         self.fail(f"still waiting after {timeout} s; the status says: {self.window.status.get()}")
+
+
+@unittest.skipUnless(HAVE_STELLA and HAVE_FFMPEG, "needs a Stella with -rawstream and ffmpeg")
+class WindowRecords(RunningWindow):
+    """Record the test ROM from the window, as a user would, but silently and
+    on the app's own Stella settings."""
+
+    @classmethod
+    def setUpClass(cls):
+        testrom.write(ROM)
+
+    def setUp(self):
+        super().setUp()
+        self.window.own_settings = True
+        v = self.window.vars
+        v["rom"].set(str(ROM))
+        v["video"].set(str(BUILD / "window.mp4"))
+        v["hear"].set(False)
 
     def recording(self, frames=30):
         """Record, and wait until the video has this many frames."""
@@ -454,6 +546,74 @@ class WindowRecords(unittest.TestCase):
         self.assertTrue(self.run_window(lambda: False), "the window closes by itself")
         self.assertTrue((BUILD / "window.mp4").is_file())
         self.assertEqual(app.load_settings(w.settings_file)["rom"], str(ROM))
+
+
+@unittest.skipUnless(HAVE_FFMPEG, "needs ffmpeg")
+class WindowMakesVideos(RunningWindow):
+    """Make videos from a capture in the window, as a user would."""
+
+    def setUp(self):
+        super().setUp()
+        BUILD.mkdir(parents=True, exist_ok=True)
+        self.capture = write_capture(BUILD / "window_clip.sscap")
+        self.window.vars["clip_capture"].set(str(self.capture))
+
+    def test_a_clip_then_a_new_name(self):
+        w, v = self.window, self.window.vars
+        self.assertEqual(v["clip_video"].get(), str(BUILD / "window_clip-clip.mp4"))
+        self.assertEqual(w.clip_note.get(), "0:03.00 long, 180 frames")
+        v["clip_from"].set("1")
+        v["clip_to"].set("0:02")
+        for name in ("window_clip-clip.mp4", "window_clip-clip-2.mp4"):
+            w.make_button.invoke()
+            self.assertTrue(w.make_button.instate(["disabled"]), "locked while it works")
+            self.assertTrue(w.record_button.instate(["disabled"]))
+            self.assertFalse(w.stop_button.instate(["disabled"]))
+            self.run_window(lambda: w.job is None)
+            self.assertTrue(w.status.get().startswith(f"Saved {BUILD / name}"), w.status.get())
+            self.assertIn("00:01, 60 frames", w.status.get())
+            self.assertIn("Clip from 0:01.00 to 0:02.00", w.note.get())
+            self.assertEqual(w.last_video, BUILD / name)
+            self.assertFalse(w.open_button.instate(["disabled"]))
+            self.assertFalse(w.make_button.instate(["disabled"]))
+        self.assertIn("(window_clip-clip.mp4 was there already)", w.status.get())
+
+    def test_the_whole_capture(self):
+        w = self.window
+        w.make_button.invoke()
+        self.run_window(lambda: w.job is None)
+        self.assertIn("00:03, 180 frames", w.status.get())
+        self.assertNotIn("Clip from", w.note.get())
+
+    def test_a_failure_says_so(self):
+        w = self.window
+        w.vars["ffmpeg"].set("no_such_ffmpeg")
+        w.make_button.invoke()
+        self.run_window(lambda: w.job is None)
+        self.assertTrue(w.status.get().startswith("Making the video failed. ffmpeg doesn't run"),
+                        w.status.get())
+
+
+class WindowMakesGifs(RunningWindow):
+    """Make a GIF from a capture in the window: no ffmpeg needed."""
+
+    def test_a_gif_of_a_clip(self):
+        w, v = self.window, self.window.vars
+        BUILD.mkdir(parents=True, exist_ok=True)
+        v["clip_capture"].set(str(write_capture(BUILD / "window_gif.sscap")))
+        v["clip_video"].set(str(BUILD / "window_gif-clip.gif"))
+        v["ffmpeg"].set("no_such_ffmpeg")
+        v["clip_from"].set("1")
+        v["clip_to"].set("0:02")
+        w.make_button.invoke()
+        self.assertTrue(w.make_button.instate(["disabled"]), "locked while it works")
+        self.run_window(lambda: w.job is None)
+        self.assertTrue(w.status.get().startswith(f"Saved {BUILD / 'window_gif-clip.gif'}: "
+                                                  "00:01, 50 frames"), w.status.get())
+        self.assertIn("GIF 640x8, 60 fps shown at 50", w.note.get())
+        self.assertEqual(w.last_video, BUILD / "window_gif-clip.gif")
+        self.assertFalse(w.open_button.instate(["disabled"]))
+        self.assertEqual(app.Job(video=BUILD / "x.gif", asked=None).what, "the GIF")
 
 
 if __name__ == "__main__":

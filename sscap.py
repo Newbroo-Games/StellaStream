@@ -10,14 +10,20 @@ As a program:
     python sscap.py game.sscap game.raw      unpack it again
     python sscap.py game.sscap               report what it holds, check every block
     python sscap.py --rom game.bin game.sscap --frames 600
+    python sscap.py game.sscap clip.sscap --from 1:20 --to 1:45
 
 With --rom it runs Stella and saves its stream as a capture until Stella is
 closed (or, with --frames, asks Stella to close after that many frames).
+--from and --to cut a clip from a capture: into a new capture when the file
+written ends in .sscap, into a raw stream otherwise.
 """
 import argparse
 import bisect
 import lzma
+import math
+import os
 import queue
+import re
 import struct
 import sys
 import threading
@@ -52,6 +58,7 @@ DEFAULT_DELTA = (b"FRAM", b"RAM ")  # sound compresses better as it is (measured
 NTSC_CYCLES_PER_SECOND = 1194720  # until a HEAD says otherwise
 MAX_BLOCK_RAW = 64 << 20          # a stream with no frames still gets blocks
 MAX_BLOCK_CYCLES = 0xFFFFFFFF - 76 * 0xFFFF  # room for one more frame
+VIDEO_SUFFIXES = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".gif"}  # record.py's job
 
 
 class CaptureError(Exception):
@@ -504,6 +511,122 @@ class Capture:
         """
         return _RawStream(self, start, on_damage)
 
+    def first_head(self):
+        """The HEAD of the first block that holds one (from the recovery
+        copies if that block is damaged), or None."""
+        for i, b in enumerate(self.blocks):
+            if b.flags & HAS_HEAD:
+                return self._last_before(i + 1, HAS_HEAD, b"HEAD")
+        return None
+
+    def cycles_per_second(self):
+        """Emulated CPU cycles a second, from the first HEAD (NTSC's when it
+        can't be read)."""
+        try:
+            head = self.first_head()
+        except CaptureError:
+            head = None
+        cps = struct.unpack_from("<I", head, 16)[0] if head and len(head) >= 20 else 0
+        return cps or NTSC_CYCLES_PER_SECOND
+
+    def seconds(self):
+        """The capture's length in seconds of emulated time."""
+        return self.cycles / self.cycles_per_second()
+
+    def clip(self, start=0.0, end=None, on_damage=None):
+        """The frames that start at or after `start` and before `end` (seconds
+        of capture time; end None: to the end) as a raw stream, a file-like
+        object for rawstream.parse().
+
+        The clip begins with the HEAD and PALT in effect at its first frame,
+        and each frame keeps the sound and RAM sent before it; Stella's own
+        frame numbers and cycle counts are unchanged. A clip that runs to the
+        end keeps what follows the last frame (END, say), so a clip of
+        everything is the raw stream byte for byte. on_damage as in stream().
+        Raises ValueError when the times are out of order or start after the
+        capture's end.
+        """
+        cps = self.cycles_per_second()
+        first = round(start * cps)
+        last = math.inf if end is None else round(end * cps)
+        if start < 0:
+            raise ValueError("a clip can't start before 0:00")
+        if end is not None and end <= start:
+            raise ValueError(f"the clip ends ({time_text(end)}) before it starts "
+                             f"({time_text(start)})")
+        if first >= self.cycles:
+            raise ValueError(f"the clip starts at {time_text(start)}, after the capture's end "
+                             f"({time_text(self.cycles / cps)})")
+        return _Pieces(self._clip(first, last, on_damage))
+
+    def _clip(self, first, last, on_damage):
+        """clip()'s bytes, from the frames that start at capture time `first`
+        (cycles) up to `last`."""
+        start = self.block_at(cycles=first) if first else 0
+        head, palt = self.context(start) if start else (None, None)
+        pending = []  # the chunks since the last frame: they go with the next one
+        taking = False
+        for i in range(start, len(self.blocks)):
+            try:
+                raw = self.read_block(i)
+            except CaptureError as e:
+                if on_damage is None:
+                    raise
+                on_damage(i, e)
+                raw = b"".join(c for b, c in self.recovery if b == i)
+            t = self.blocks[i].capture_time
+            pos = 0
+            for tag, c in chunks_in(raw):
+                pos += len(c)
+                if tag != b"FRAM":
+                    pending.append(c)
+                    continue
+                if t >= last:
+                    return
+                if t >= first:
+                    if not taking:
+                        taking = True
+                        sent = {p[:4] for p in pending}  # a new HEAD or PALT comes with it
+                        yield b"".join(x for x, name in ((head, b"HEAD"), (palt, b"PALT"))
+                                       if x and name not in sent)
+                    yield b"".join(pending) + c
+                else:
+                    for p in pending:
+                        if p[:4] == b"HEAD":
+                            head = p
+                        elif p[:4] == b"PALT":
+                            palt = p
+                pending = []
+                t += 76 * (struct.unpack_from("<H", c, 20)[0] if len(c) >= 22 else 0)
+            if pos < len(raw):
+                pending.append(raw[pos:])  # a stream cut off inside a chunk
+        if taking:
+            yield b"".join(pending)  # what follows the last frame: END, say
+
+
+class _Pieces:
+    """Byte strings from an iterator as a file-like object (read(n))."""
+
+    def __init__(self, pieces):
+        self._pieces = iter(pieces)
+        self._buf, self._pos = b"", 0
+
+    def read(self, n=-1):
+        parts = []
+        while n:
+            if self._pos >= len(self._buf):
+                self._buf, self._pos = next(self._pieces, None), 0
+                if self._buf is None:
+                    self._buf = b""
+                    break
+                continue
+            take = len(self._buf) - self._pos if n < 0 else min(n, len(self._buf) - self._pos)
+            parts.append(self._buf[self._pos:self._pos + take])
+            self._pos += take
+            if n > 0:
+                n -= take
+        return b"".join(parts)
+
 
 class _RawStream:
     def __init__(self, capture, start, on_damage):
@@ -549,6 +672,37 @@ def is_capture(path):
         return False
 
 
+def parse_time(text):
+    """'80', '80.5', '1:20' or '1:02:03.5' -> seconds. Raises ValueError."""
+    *whole, last = text.strip().split(":")
+    if (len(whole) > 2 or not all(re.fullmatch(r"[0-9]+", p) for p in whole)
+            or not re.fullmatch(r"[0-9]+(\.[0-9]*)?|\.[0-9]+", last)
+            or any(int(p) >= 60 for p in whole[1:]) or (whole and float(last) >= 60)):
+        raise ValueError(f"not a time: '{text}' (seconds, minutes:seconds or "
+                         "hours:minutes:seconds)")
+    seconds = 0
+    for p in whole:
+        seconds = seconds * 60 + int(p)
+    return seconds * 60 + float(last)
+
+
+def time_text(seconds):
+    """80.5 -> '1:20.50', 3723.5 -> '1:02:03.50'."""
+    hundredths = round(seconds * 100)
+    minutes, rest = divmod(hundredths, 6000)
+    hours, minutes = divmod(minutes, 60)
+    secs = f"{rest // 100:02d}.{rest % 100:02d}"
+    return f"{hours}:{minutes:02d}:{secs}" if hours else f"{minutes}:{secs}"
+
+
+def time_option(text):
+    """parse_time() for argparse."""
+    try:
+        return parse_time(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
 def _size(n):
     for unit in ("bytes", "KB", "MB", "GB"):
         if n < 1000 or unit == "GB":
@@ -558,11 +712,7 @@ def _size(n):
 
 def _seconds(cap):
     """Capture time in seconds, with the first HEAD's cycles per second."""
-    head = None
-    for i, b in enumerate(cap.blocks):
-        if b.flags & HAS_HEAD:
-            head = cap._last_before(i + 1, HAS_HEAD, b"HEAD")
-            break
+    head = cap.first_head()
     cps = struct.unpack_from("<I", head, 16)[0] if head and len(head) >= 20 else 0
     return (cap.cycles / cps if cps else None), head
 
@@ -683,29 +833,42 @@ def main():
     ap.add_argument("--no-recovery", action="store_true",
                     help="leave out the copies of HEAD and PALT at the end")
     ap.add_argument("--verbose", "-v", action="store_true", help="report: one line per block")
+    ap.add_argument("--from", dest="start", type=time_option, metavar="TIME",
+                    help="a clip of a capture: from this time (seconds, or minutes:seconds)")
+    ap.add_argument("--to", dest="end", type=time_option, metavar="TIME",
+                    help="a clip of a capture: up to this time (default: the end)")
     args = ap.parse_args()
 
     options = dict(method=METHODS[args.method], level=args.level,
                    delta_tags=[t.strip() for t in args.delta.split(",") if t.strip()],
                    block_seconds=args.block_seconds, recovery=not args.no_recovery)
+    clip = args.start is not None or args.end is not None
     try:
         if args.rom:
             if len(args.paths) != 1:
                 ap.error("with --rom, give only the capture to write")
+            if clip:
+                ap.error("--from and --to cut a clip from a capture, not from --rom")
             ok = _record(args, options)
         elif len(args.paths) == 1:
+            if clip:
+                ap.error("--from and --to need a capture to cut and a file to write")
             ok = report(args.paths[0], args.verbose)
         elif len(args.paths) == 2:
             source, target = args.paths
+            if _same_file(source, target):
+                ap.error("the file to write is the one being read")
+            suffix = os.path.splitext(target)[1].lower()
+            if suffix in VIDEO_SUFFIXES:
+                what = "a GIF" if suffix == ".gif" else "a video"
+                ap.error(f"sscap.py writes captures and raw streams, not videos or GIFs. For "
+                         f"{what}: python record.py {source} {target}"
+                         + (" (with the same --from and --to)" if clip else ""))
             if is_capture(source):
-                with open(source, "rb") as f, open(target, "wb") as out:
-                    cap = Capture(f)
-                    stream = cap.stream()
-                    while part := stream.read(1 << 20):
-                        out.write(part)
-                    size = out.tell()
-                print(f"Unpacked {len(cap.blocks)} blocks into {_size(size)}", file=sys.stderr)
-                ok = True
+                ok = _from_capture(source, target, args, options)
+            elif clip:
+                ap.error("--from and --to cut a clip from a capture (.sscap); pack the "
+                         "stream first")
             else:
                 start, cpu = time.monotonic(), time.process_time()
                 with open(source, "rb") as f, open(target, "wb") as out, \
@@ -721,6 +884,51 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     sys.exit(0 if ok else 1)
+
+
+def _same_file(a, b):
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False  # one of them isn't there yet
+
+
+def _from_capture(source, target, args, options):
+    """Unpack a capture, or a clip of it (--from, --to), into a raw stream;
+    or pack it into a new capture when target ends in .sscap. True if it
+    holds a frame."""
+    start, cpu = time.monotonic(), time.process_time()
+    clip = args.start is not None or args.end is not None
+    packing = target.lower().endswith(".sscap")
+    with open(source, "rb") as f:
+        cap = Capture(f)
+        if clip:
+            stream = cap.clip(args.start or 0.0, args.end)
+            length = cap.seconds()
+            end = length if args.end is None else min(args.end, length)
+            what = f"the clip from {time_text(args.start or 0.0)} to {time_text(end)}"
+        else:
+            stream, what = cap.stream(), f"{len(cap.blocks)} blocks"
+        taken = 0
+        with open(target, "wb") as out:
+            w = Writer(out, **options) if packing else out
+            while part := stream.read(1 << 20):
+                w.write(part)
+                taken += len(part)
+            if packing:
+                w.close()
+            size = out.tell()
+    if clip and not taken:
+        os.remove(target)
+        print(f"Error: no frame starts in {what}", file=sys.stderr)
+        return False
+    if not packing:
+        print(f"Unpacked {what} into {_size(size)}", file=sys.stderr)
+    else:
+        if clip:
+            print(f"Packed {what} of {source}", file=sys.stderr)
+        print(summary(w, time.monotonic() - start, time.process_time() - cpu), file=sys.stderr)
+    return True
 
 
 def _record(args, options):

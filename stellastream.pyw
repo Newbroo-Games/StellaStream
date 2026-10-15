@@ -4,7 +4,9 @@ The window is a front end for record.py. Fill in the game and the video; the
 window shows the Stella command it will run, and remembers every field in a
 settings file of the user's own (settings_path()). Record runs
 record.record_rom() in a worker thread, which reports through a queue the
-window reads every POLL_MS.
+window reads every POLL_MS. Under "Video or GIF from a capture", Make video
+runs record.record_capture() the same way, on the part of a capture between
+two times; a name ending in .gif makes an animated GIF (gif.py).
 
     python stellastream.pyw
 """
@@ -24,6 +26,7 @@ from tkinter import filedialog, ttk
 
 import rawstream
 import record
+import sscap
 
 # (shown, sent to Stella); Auto sends nothing and lets Stella decide
 CONTROLLERS = [
@@ -44,6 +47,7 @@ DEFAULTS = {
     "save": "VIDEO", "video": "", "capture": "", "scale": 1, "stereo": False, "hear": True,
     "time_limit": False, "seconds": 60,
     "more": False, "stella": "", "ffmpeg": "ffmpeg", "extra": "", "crf": 12, "keep": False,
+    "clip": False, "clip_capture": "", "clip_from": "", "clip_to": "", "clip_video": "",
 }
 RANGES = {"scale": (1, 2), "seconds": (1, 24 * 3600), "crf": (0, 51)}
 VIDEO_TYPES = (".mp4", ".mkv", ".mov")  # files ffmpeg puts H.264 and AAC in
@@ -137,21 +141,71 @@ def default_capture(video):
     return str(video.with_suffix(".sscap")) if video.name else ""
 
 
-def _beside_rom(s, key):
+def default_clip_video(capture, suffix=".mp4"):
+    """The name of a video (or, with suffix .gif, a GIF) made from a capture
+    when the user hasn't chosen one: the capture's, as -clip.mp4."""
+    capture = Path(capture.strip())
+    return str(capture.with_name(capture.stem + "-clip" + suffix)) if capture.name else ""
+
+
+def _beside(s, key, base="rom"):
     """The path in field key; a name without a folder, or a relative path,
-    counts from the ROM's folder."""
+    counts from the folder of the file in field base (the ROM's)."""
     path = Path(s[key].strip())
-    return path if path.is_absolute() else Path(s["rom"].strip()).absolute().parent / path
+    return path if path.is_absolute() else Path(s[base].strip()).absolute().parent / path
 
 
 def video_path(s):
     """Where settings s save the video."""
-    return _beside_rom(s, "video")
+    return _beside(s, "video")
 
 
 def capture_path(s):
     """Where settings s save the capture."""
-    return _beside_rom(s, "capture")
+    return _beside(s, "capture")
+
+
+def clip_video_path(s):
+    """Where settings s save the video made from a capture: next to the
+    capture unless the name has a folder."""
+    return _beside(s, "clip_video", base="clip_capture")
+
+
+def clip_times(s):
+    """(start, end) in seconds from the From and To fields; an empty From is
+    the start (0), an empty To the end (None). ValueError says what to fix."""
+    times = []
+    for key, name in (("clip_from", "From"), ("clip_to", "To")):
+        text = s[key].strip()
+        try:
+            times.append(sscap.parse_time(text) if text else None)
+        except ValueError:
+            raise ValueError(f"{name}: give a time such as 80, 1:20 or 1:20.5 "
+                             "(minutes:seconds).") from None
+    start, end = times
+    if start is not None and end is not None and end <= start:
+        raise ValueError("To must be after From.")
+    return start or 0.0, end
+
+
+def capture_length(path):
+    """(seconds, frames) of a capture file. Raises CaptureError or OSError."""
+    with open(path, "rb") as f:
+        cap = sscap.Capture(f)
+        return cap.seconds(), cap.frames
+
+
+def capture_note(path):
+    """The line under the capture field: its length, or why it can't be read;
+    empty while there is no file of that name."""
+    path = path.strip()
+    if not path or not Path(path).is_file():
+        return ""
+    try:
+        seconds, frames = capture_length(path)
+    except (sscap.CaptureError, OSError) as e:
+        return f"Can't read it: {e}"
+    return f"{sscap.time_text(seconds)} long, {frames:,} frames"
 
 
 def _numbered(path, n):
@@ -198,6 +252,9 @@ def check_fields(s, found_stella=None):
         if not s["video"].strip():
             return "Choose where to save the video."
         video = video_path(s)
+        if record.is_gif(video):
+            return ("A GIF is made from a capture: save a Capture (or Both), then make the "
+                    "GIF under Video or GIF from a capture.")
         if video.suffix.lower() not in VIDEO_TYPES:
             return "The video's name must end in .mp4 (or .mkv or .mov)."
         targets.append(("video", video))
@@ -219,13 +276,50 @@ def check_fields(s, found_stella=None):
     except ValueError:
         return "Extra Stella options: a quote isn't closed."
     for what, path in targets:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryFile(dir=path.parent):
-                pass
-        except OSError as e:
-            return f"Can't save the {what} in {path.parent}: {e.strerror or e}"
+        problem = _cant_save(what, path)
+        if problem:
+            return problem
     return None
+
+
+def _cant_save(what, path):
+    """Why a file can't be saved at path, or None; makes its folder if it isn't there."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=path.parent):
+            pass
+    except OSError as e:
+        return f"Can't save the {what} in {path.parent}: {e.strerror or e}"
+    return None
+
+
+def check_clip_fields(s):
+    """The first thing in settings s that stops making a video or a GIF from
+    a capture, as a message saying what to fix; None if nothing does. Like
+    check_fields(), this makes the video's folder if it isn't there."""
+    capture = s["clip_capture"].strip()
+    if not capture:
+        return "Choose the capture to make a video or GIF from."
+    if not Path(capture).is_file():
+        return f"The capture file isn't there: {capture}"
+    try:
+        seconds, _ = capture_length(capture)
+    except (sscap.CaptureError, OSError) as e:
+        return f"Can't read the capture: {e}."
+    try:
+        start, _ = clip_times(s)
+    except ValueError as e:
+        return str(e)
+    if start >= seconds:
+        return f"From is at or after the capture's end ({sscap.time_text(seconds)})."
+    if not s["clip_video"].strip():
+        return "Choose where to save the video or GIF."
+    video = clip_video_path(s)
+    if record.is_gif(video):
+        return _cant_save("GIF", video)
+    if video.suffix.lower() not in VIDEO_TYPES:
+        return "The name must end in .mp4 or .gif (or .mkv or .mov)."
+    return _cant_save("video", video)
 
 
 def clock(seconds):
@@ -255,11 +349,13 @@ def open_file(path):
 
 @dataclass
 class Job:
-    """A recording under way: its worker thread and what it shares with the window."""
+    """A recording, or a video being made from a capture, under way: its
+    worker thread and what it shares with the window."""
     video: Path   # the video it is saved to; None when only a capture is saved
     asked: Path   # the video the fields name; video differs when that one was there already
     capture: Path = None        # the capture it is saved to, if any
     asked_capture: Path = None  # the capture the fields name
+    source: Path = None         # the capture a video is made from (None: recording)
     there: list = field(default_factory=list)  # the files named that were there already
     thread: threading.Thread = None
     messages: queue.Queue = field(default_factory=queue.Queue)
@@ -270,18 +366,21 @@ class Job:
 
     @property
     def what(self):
-        """'the video', 'the capture' or 'the files', for the status line."""
+        """'the video', 'the GIF', 'the capture' or 'the files', for the status line."""
         if self.video and self.capture:
             return "the files"
-        return "the video" if self.video else "the capture"
+        if self.video:
+            return "the GIF" if record.is_gif(self.video) else "the video"
+        return "the capture"
 
 
-def record_in_thread(messages, **kwargs):
-    """The worker thread: run record.record_rom(**kwargs) and put everything it
-    says on messages, since only the main thread may touch the window."""
+def work_in_thread(messages, work, **kwargs):
+    """The worker thread: run work(**kwargs) (record.record_rom or
+    record.record_capture) and put everything it says on messages, since only
+    the main thread may touch the window."""
     try:
-        result = record.record_rom(progress=lambda *p: messages.put(("progress", p)),
-                                   log=lambda note: messages.put(("note", note)), **kwargs)
+        result = work(progress=lambda *p: messages.put(("progress", p)),
+                      log=lambda note: messages.put(("note", note)), **kwargs)
         messages.put(("done", result))
     except (record.RecordError, OSError) as e:
         messages.put(("error", str(e)))
@@ -297,11 +396,15 @@ class App:
         s = load_settings(self.settings_file)
         if not s["capture"].strip():
             s["capture"] = default_capture(s["video"])
+        if not s["clip_video"].strip():
+            s["clip_video"] = default_clip_video(s["clip_capture"])
         self._good = dict(s)  # last valid value of each number field
         self._save_job = None
-        self._more_shown = None
+        self._folds = {}       # key: (button, frame, title) of each fold
+        self._fold_shown = {}  # key: shown or not, as last drawn
         self._last_rom = s["rom"]
         self._last_video = s["video"]
+        self._last_clip_capture = s["clip_capture"]
         self._wrap = None
         self.inputs = []          # what is locked while recording
         self.job = None           # the recording under way
@@ -322,6 +425,10 @@ class App:
         self._build()
         self.vars["rom"].trace_add("write", self._rom_changed)
         self.vars["video"].trace_add("write", self._video_changed)
+        self.vars["clip_capture"].trace_add("write", self._clip_capture_changed)
+        self.vars["clip_video"].trace_add("write", self._clip_video_changed)
+        self.clip_note.set(capture_note(s["clip_capture"]))
+        self._clip_video_changed()
         for var in self.vars.values():
             var.trace_add("write", self._changed)
         self._update()
@@ -389,12 +496,8 @@ class App:
                                 textvariable=v["seconds"])).pack(side="left", padx=6)
         ttk.Label(limit, text="seconds").pack(side="left")
 
-        self.fold = ttk.Button(main, style="Toolbutton",
-                               command=lambda: v["more"].set(not v["more"].get()))
-        self.fold.grid(row=2, sticky="w", pady=(8, 0))
-        more = self.more = ttk.Frame(main, padding=(10, 0, 10, 4))
-        more.grid(row=3, sticky="ew")
-        more.columnconfigure(1, weight=1)
+        self.fold, more = self._fold(main, 2, "more", "More options")
+        self.more = more
         self._file_row(more, 0, "Stella program", "stella",
                        lambda: self._browse_program("stella", "Choose Stella"))
         found = ("Empty: the one found automatically (see the command below)"
@@ -425,8 +528,32 @@ class App:
         ttk.Button(box, text="Copy", command=self._copy_command).grid(
             row=0, column=1, sticky="n", padx=(8, 0))
 
+        # A video or a GIF of a capture, or of the part of it between two times
+        self.clip_fold, clip = self._fold(main, 5, "clip", "Video or GIF from a capture")
+        self.clip_box = clip
+        self._file_row(clip, 0, "Capture file", "clip_capture", self._browse_clip_capture)
+        self.clip_note = tk.StringVar()
+        ttk.Label(clip, textvariable=self.clip_note, style="Note.TLabel").grid(
+            row=1, column=1, columnspan=2, sticky="w")
+        self._label(clip, 2, "From")
+        times = ttk.Frame(clip)
+        times.grid(row=2, column=1, columnspan=2, sticky="w", pady=PADY)
+        self._input(ttk.Entry(times, textvariable=v["clip_from"], width=10)).pack(side="left")
+        ttk.Label(times, text="To").pack(side="left", padx=(16, 8))
+        self._input(ttk.Entry(times, textvariable=v["clip_to"], width=10)).pack(side="left")
+        ttk.Label(times, text="(minutes:seconds; empty: the start, the end)",
+                  style="Note.TLabel").pack(side="left", padx=(16, 0))
+        self._file_row(clip, 3, "Video or GIF file", "clip_video", self._browse_clip_video)
+        make = ttk.Frame(clip)
+        make.grid(row=4, column=0, columnspan=3, sticky="w", pady=(PADY, 0))
+        self.make_button = ttk.Button(make, command=self.make_video)  # its text: _clip_video_changed()
+        self.make_button.pack(side="left")
+        self.make_note = tk.StringVar()
+        ttk.Label(make, textvariable=self.make_note, style="Note.TLabel").pack(
+            side="left", padx=(16, 0))
+
         bar = ttk.Frame(main)
-        bar.grid(row=5, sticky="ew", pady=(12, 0))
+        bar.grid(row=7, sticky="ew", pady=(12, 0))
         self.record_button = ttk.Button(bar, text="● Record", command=self.record)
         self.record_button.pack(side="left")
         self.stop_button = ttk.Button(bar, text="■ Stop", state="disabled", command=self.stop)
@@ -441,10 +568,10 @@ class App:
         self.status = tk.StringVar(value="Ready to record.")
         self.note = tk.StringVar()
         self.status_label = ttk.Label(main, textvariable=self.status, justify="left")
-        self.status_label.grid(row=6, sticky="ew", pady=(8, 0))
+        self.status_label.grid(row=8, sticky="ew", pady=(8, 0))
         self.note_label = ttk.Label(main, textvariable=self.note, justify="left",
                                     style="Note.TLabel")
-        self.note_label.grid(row=7, sticky="ew")
+        self.note_label.grid(row=9, sticky="ew")
         self.status_label.bind("<Configure>", lambda e: self._wrap_status(e.width))
 
     def _box(self, parent, row, title):
@@ -452,6 +579,18 @@ class App:
         box.grid(row=row, sticky="ew", pady=(0 if row == 0 else 10, 0))
         box.columnconfigure(1, weight=1)
         return box
+
+    def _fold(self, parent, row, key, title):
+        """A button that shows or hides a frame of fields (field key: shown);
+        returns the two. The frame's columns line up with the boxes'."""
+        button = ttk.Button(parent, style="Toolbutton",
+                            command=lambda: self.vars[key].set(not self.vars[key].get()))
+        button.grid(row=row, sticky="w", pady=(8, 0))
+        frame = ttk.Frame(parent, padding=(10, 0, 10, 4))
+        frame.grid(row=row + 1, sticky="ew")
+        frame.columnconfigure(1, weight=1)
+        self._folds[key] = (button, frame, title)
+        return button, frame
 
     def _label(self, parent, row, text):
         ttk.Label(parent, text=text, width=LABEL_WIDTH).grid(row=row, column=0, sticky="w")
@@ -524,6 +663,30 @@ class App:
             self.vars["capture"].set(default_capture(video))
         self._last_video = video
 
+    def _clip_capture_changed(self, *_):
+        # The video (or GIF) made from a capture follows it the same way; the
+        # note says how long it is
+        capture = self.vars["clip_capture"].get()
+        video = self.vars["clip_video"].get()
+        suffix = ".gif" if record.is_gif(video.strip()) else ".mp4"
+        if not video.strip() or video == default_clip_video(self._last_clip_capture, suffix):
+            self.vars["clip_video"].set(default_clip_video(capture, suffix))
+        self._last_clip_capture = capture
+        self.clip_note.set(capture_note(capture))
+        self.root.after_idle(self._fit_window)
+
+    def _clip_video_changed(self, *_):
+        # The button and its note say what the name will make: a video or a GIF
+        if record.is_gif(self.vars["clip_video"].get().strip()):
+            self.make_button.configure(text="Make GIF")
+            self.make_note.set("(an animated GIF: Stella's colors, 640 wide, "
+                               "50 frames a second, no sound)")
+        else:
+            self.make_button.configure(text="Make video")
+            self.make_note.set("(size, stereo sound and quality: as for recording; "
+                               "name it .gif for an animated GIF)")
+        self.root.after_idle(self._fit_window)
+
     def _changed(self, *_):
         self._update()
         if self._save_job:
@@ -541,8 +704,9 @@ class App:
         self.command.insert("1.0", text)
         self.command.configure(state="disabled")
         self._fit_command()
-        if s["more"] != self._more_shown:
-            self._show_more(s["more"])
+        for key in self._folds:
+            if s[key] != self._fold_shown.get(key):
+                self._show_fold(key, s[key])
         if not self.job:
             self._grey_unsaved(s["save"])
 
@@ -562,13 +726,14 @@ class App:
             self.command.configure(height=lines)
             self.root.after_idle(self._fit_window)
 
-    def _show_more(self, show):
-        self._more_shown = show
-        self.fold.configure(text=("▾" if show else "▸") + " More options")
+    def _show_fold(self, key, show):
+        button, frame, title = self._folds[key]
+        self._fold_shown[key] = show
+        button.configure(text=("▾" if show else "▸") + " " + title)
         if show:
-            self.more.grid()
+            frame.grid()
         else:
-            self.more.grid_remove()
+            frame.grid_remove()
         self.root.after_idle(self._fit_window)
 
     def _fit_window(self):
@@ -598,10 +763,11 @@ class App:
 
     # --- recording ---
 
-    def problem(self):
-        """The first thing to fix before recording, as a message; None if nothing."""
+    def problem(self, clip=False):
+        """The first thing to fix before recording (clip: before making a
+        video from a capture), as a message; None if nothing."""
         numbers = [("crf", "Quality, under More options")]
-        if self.vars["time_limit"].get():
+        if self.vars["time_limit"].get() and not clip:
             numbers.insert(0, ("seconds", "Stop after"))
         for key, name in numbers:
             low, high = RANGES[key]
@@ -611,7 +777,8 @@ class App:
                 good = False
             if not good:
                 return f"{name}: give a whole number from {low} to {high}."
-        return check_fields(self.settings(), self.found_stella)
+        s = self.settings()
+        return check_clip_fields(s) if clip else check_fields(s, self.found_stella)
 
     def record(self):
         """Check the fields, then record in a worker thread."""
@@ -627,15 +794,41 @@ class App:
         asked_capture = capture_path(s) if s["save"] != "VIDEO" else None
         there = there_already(asked, asked_capture)
         video, capture = free_names(asked, asked_capture)
-        job = self.job = Job(video=video, asked=asked, capture=capture,
-                             asked_capture=asked_capture, there=there)
-        job.thread = threading.Thread(target=record_in_thread, args=(job.messages,), kwargs=dict(
-            rom=s["rom"].strip(), out_path=job.video, capture=job.capture,
-            stella=s["stella"].strip() or self.found_stella,
-            stella_args=stella_options(s), sound=s["hear"], own_settings=self.own_settings,
-            ffmpeg=s["ffmpeg"].strip() or "ffmpeg", stop=job.stop, finishing=job.finishing,
-            scale=s["scale"], stereo=s["stereo"], crf=s["crf"], keep=s["keep"],
-            seconds=s["seconds"] if s["time_limit"] else None))
+        job = Job(video=video, asked=asked, capture=capture, asked_capture=asked_capture,
+                  there=there)
+        self._start(job, record.record_rom, s,
+                    rom=s["rom"].strip(), out_path=job.video, capture=job.capture,
+                    stella=s["stella"].strip() or self.found_stella,
+                    stella_args=stella_options(s), sound=s["hear"],
+                    own_settings=self.own_settings,
+                    seconds=s["seconds"] if s["time_limit"] else None)
+
+    def make_video(self):
+        """Check the fields under Video from a capture, then make the video in
+        a worker thread."""
+        if self.job:
+            return
+        problem = self.problem(clip=True)
+        if problem:
+            self._say(problem)
+            return
+        self.save()
+        s = self.settings()
+        start, end = clip_times(s)
+        asked = clip_video_path(s)
+        job = Job(video=free_name(asked), asked=asked, there=there_already(asked),
+                  source=Path(s["clip_capture"].strip()))
+        self._start(job, record.record_capture, s, path=job.source, out_path=job.video,
+                    start=start or None, end=end)
+
+    def _start(self, job, work, s, **kwargs):
+        """Run work(**kwargs) for job in a worker thread, with the video
+        settings of s; the window locks until it is done."""
+        self.job = job
+        job.thread = threading.Thread(target=work_in_thread, args=(job.messages, work), kwargs=dict(
+            kwargs, ffmpeg=s["ffmpeg"].strip() or "ffmpeg", stop=job.stop,
+            finishing=job.finishing, scale=s["scale"], stereo=s["stereo"], crf=s["crf"],
+            keep=s["keep"]))
         self._lock(True)
         self.note.set("")
         self._show_job()
@@ -651,7 +844,7 @@ class App:
 
     def _lock(self, recording):
         """While recording, the fields can't change and only Stop works."""
-        for widget in self.inputs + [self.record_button]:
+        for widget in self.inputs + [self.record_button, self.make_button]:
             widget.state(["disabled" if recording else "!disabled"])
         if not recording:
             self._grey_unsaved(self.settings()["save"])
@@ -667,13 +860,13 @@ class App:
         elif job.finishing.is_set():
             text = f"Finishing {job.what}..."
         elif job.stop.is_set():
-            text = "Stopping: closing Stella..."
+            text = "Stopping..." if job.source else "Stopping: closing Stella..."
         elif job.progress:
             frames, seconds, size = job.progress
-            text = (f"Recording...   {clock(seconds)}   {frames:,} frames   "
-                    f"{size / 1e6:.1f} MB")
+            text = (f"{'Making ' + job.what if job.source else 'Recording'}...   "
+                    f"{clock(seconds)}   {frames:,} frames   {size / 1e6:.1f} MB")
         else:
-            text = "Starting Stella..."
+            text = "Reading the capture..." if job.source else "Starting Stella..."
         if text != self.status.get():
             self._say(text)
 
@@ -702,7 +895,7 @@ class App:
         self._lock(False)
         if error:
             self.closing = False  # stay open to show why
-            self._say(f"The recording failed. {error}")
+            self._say(f"{'Making ' + job.what if job.source else 'The recording'} failed. {error}")
             return
         self.last_video = done.path  # the video, or the capture when there is none
         if job.video:
@@ -769,6 +962,27 @@ class App:
             filetypes=[("StellaStream capture", "*.sscap"), ("All files", "*")])
         if path:
             self.vars["capture"].set(str(Path(path)))
+
+    def _browse_clip_capture(self):
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Choose the capture", initialdir=self._folder_of("clip_capture"),
+            filetypes=[("StellaStream capture", "*.sscap"), ("All files", "*")])
+        if path:
+            self.vars["clip_capture"].set(str(Path(path)))
+
+    def _browse_clip_video(self):
+        current = self.vars["clip_video"].get().strip()
+        types = [("MP4 video", "*.mp4"), ("Animated GIF (no sound)", "*.gif")]
+        if record.is_gif(current):
+            types.reverse()  # the dialog lists the first type
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Save the video or GIF as",
+            initialdir=self._folder_of("clip_video") or self._folder_of("clip_capture"),
+            initialfile=Path(current).name if current else None,
+            defaultextension=".gif" if record.is_gif(current) else ".mp4",
+            filetypes=types + [("All files", "*")])
+        if path:
+            self.vars["clip_video"].set(str(Path(path)))
 
     def _browse_program(self, key, title):
         types = [("Programs", "*.exe")] if sys.platform == "win32" else []

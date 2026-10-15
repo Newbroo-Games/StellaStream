@@ -275,6 +275,85 @@ class Reading(unittest.TestCase):
             opened(bytes(data))
 
 
+class Clips(unittest.TestCase):
+    """Capture.clip(): the frames that start between two times, each with the
+    chunks sent before it, after the HEAD and PALT in effect."""
+
+    def test_times(self):
+        for text, seconds in (("80", 80), ("80.5", 80.5), (".5", 0.5), ("1:20", 80),
+                              ("01:20.25", 80.25), ("1:02:03.5", 3723.5), (" 0:00 ", 0)):
+            with self.subTest(text):
+                self.assertEqual(sscap.parse_time(text), seconds)
+        for text in ("", "x", "-1", "1:60", "1:75:00", "1:2:3:4", "1.5:00", "nan", "inf",
+                     "1e3", "1:"):
+            with self.subTest(text):
+                with self.assertRaises(ValueError):
+                    sscap.parse_time(text)
+        self.assertEqual([sscap.time_text(s) for s in (0, 80.5, 3723.5, 59.999)],
+                         ["0:00.00", "1:20.50", "1:02:03.50", "1:00.00"])
+        for s in (0, 1.25, 80.5, 3723.5):
+            self.assertEqual(sscap.parse_time(sscap.time_text(s)), s)
+
+    def test_a_clip_of_everything_is_the_stream(self):
+        for raw in (MIXED, game(130)[:-1000]):
+            with self.subTest(len(raw)):
+                cap = opened(pack(raw))
+                self.assertEqual(cap.clip().read(), raw)
+                self.assertEqual(cap.clip(0, cap.seconds()).read(), raw)
+
+    def test_a_clip_is_its_frames(self):
+        cap = opened(pack(game(300)))  # frame n starts at n/60 s; blocks of 60 frames
+        self.assertEqual(cap.clip(1.5, 2.5).read(),
+                         head() + palette() + run(60, start=90, cycles=90 * NTSC))
+        self.assertEqual(cap.clip(4.5).read(),
+                         head() + palette() + run(30, start=270, cycles=270 * NTSC))
+        self.assertEqual(cap.clip(4.0, 99).read(),
+                         head() + palette() + run(60, start=240, cycles=240 * NTSC))
+
+    def test_the_head_and_palette_in_effect(self):
+        other = chunk("PALT", bytes(255 - i % 256 for i in range(768)))
+        cap = opened(pack(game(100) + other + run(100, start=100, cycles=100 * NTSC)))
+        self.assertEqual(cap.clip(1.0, 1.5).read(),
+                         head() + palette() + run(30, start=60, cycles=60 * NTSC))
+        self.assertEqual(cap.clip(2.0, 2.5).read(),
+                         head() + other + run(30, start=120, cycles=120 * NTSC))
+        # From the frame the new palette comes with: it isn't sent twice
+        self.assertEqual(cap.clip(100 / 60, 110 / 60).read(),
+                         head() + other + run(10, start=100, cycles=100 * NTSC))
+
+    def test_chunks_before_a_frame_go_with_it(self):
+        cap = opened(pack(MIXED))
+        self.assertEqual(cap.clip(70 / 60, 71 / 60).read(),
+                         head() + palette() + chunk("ZZZZ", b"a later chunk")
+                         + chunk("JUMP", b"\x01") + run(1, start=10))
+        self.assertEqual(cap.clip(2.0, 2.5).read(),
+                         head() + palette() + run(30, start=60, height=30))
+        before = len(game(70) + chunk("ZZZZ", b"a later chunk") + chunk("JUMP", b"\x01")
+                     + run(50, start=10))
+        self.assertEqual(cap.clip(2.0).read(), head() + palette() + MIXED[before:],
+                         "to the end: the ROM load and END too")
+
+    def test_times_outside_the_capture(self):
+        cap = opened(pack(game(300)))
+        with self.assertRaisesRegex(ValueError, r"after the capture's end \(0:05.00\)"):
+            cap.clip(5.0)
+        with self.assertRaisesRegex(ValueError, "before it starts"):
+            cap.clip(2.0, 1.0)
+        with self.assertRaises(ValueError):
+            cap.clip(-1)
+
+    def test_a_damaged_block_is_left_out(self):
+        data = pack(game(300))
+        cap = opened(damaged(data, opened(data).blocks[2].offset + 36 + 20))
+        notes = []
+        self.assertEqual(cap.clip(1.5, 3.5, on_damage=lambda i, e: notes.append(i)).read(),
+                         head() + palette() + run(30, start=90, cycles=90 * NTSC)
+                         + run(30, start=180, cycles=180 * NTSC))
+        self.assertEqual(notes, [2])
+        with self.assertRaises(CaptureError):
+            cap.clip(1.5, 3.5).read()
+
+
 class Spec(unittest.TestCase):
     """docs/capture-format.md and sscap.py must say the same thing."""
 
@@ -335,6 +414,34 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertIn("1 of 3 blocks damaged", done.stdout)
 
+    def test_clips(self):
+        BUILD.mkdir(parents=True, exist_ok=True)
+        source, clip = BUILD / "cli_clip_source.sscap", BUILD / "cli_clip.sscap"
+        clip_raw, raw = BUILD / "cli_clip.raw", BUILD / "cli_clip_source.raw"
+        source.write_bytes(pack(MIXED))
+        raw.write_bytes(MIXED)
+        expected = opened(pack(MIXED)).clip(1, 2).read()
+        done = self.sscap(source, clip, "--from", "1", "--to", "0:02")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("the clip from 0:01.00 to 0:02.00", done.stderr)
+        self.assertIn("1 blocks, 60 frames", done.stderr)
+        self.assertEqual(opened(clip.read_bytes()).stream().read(), expected)
+        done = self.sscap(source, clip_raw, "--from", "1", "--to", "2")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(clip_raw.read_bytes(), expected)
+        for args, code, message in (((source, clip, "--from", "1:99"), 2, "not a time"),
+                                    ((source, clip, "--from", "9"), 1, "after the capture's end"),
+                                    ((raw, clip, "--from", "1"), 2, "pack the stream first"),
+                                    ((source, "--from", "1"), 2, "a file to write"),
+                                    ((source, source, "--from", "1"), 2, "the one being read"),
+                                    ((source, BUILD / "never.mp4"), 2, "For a video: python record.py"),
+                                    ((source, BUILD / "never.gif"), 2, "For a GIF: python record.py")):
+            with self.subTest(message):
+                done = self.sscap(*args)
+                self.assertEqual(done.returncode, code, done.stderr)
+                self.assertIn(message, done.stderr)
+        self.assertEqual(source.read_bytes(), pack(MIXED))
+
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "needs ffmpeg")
 class Video(unittest.TestCase):
@@ -361,6 +468,28 @@ class Video(unittest.TestCase):
                               cwd=ROOT)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("180 frames", done.stderr)
+
+    def test_video_of_a_clip(self):
+        raw = run_of_frames(180, 524)
+        path = self.capture("video_clip.sscap", raw)
+        result = record.record_capture(path, BUILD / "video_clip.mp4", start=1.0, end=2.0,
+                                       log=lambda m: None)
+        self.assertEqual((result.frames, result.end_seen), (60, False))
+        with self.assertRaisesRegex(record.RecordError, "Can't cut that clip"):
+            record.record_capture(path, BUILD / "never.mp4", start=5, log=lambda m: None)
+
+        def cli(*args):
+            return subprocess.run([sys.executable, str(ROOT / "record.py"), *map(str, args)],
+                                  capture_output=True, text=True, cwd=ROOT)
+
+        done = cli(path, BUILD / "video_clip_cli.mp4", "--from", "0:01.5")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Clip from 0:01.50 to 0:03.00", done.stderr)
+        self.assertIn("90 frames", done.stderr)
+        (BUILD / "video_clip.raw").write_bytes(raw)
+        done = cli(BUILD / "video_clip.raw", BUILD / "never.mp4", "--to", "1")
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("cut a clip from a capture", done.stderr)
 
     def test_a_damaged_block_is_skipped(self):
         notes = []

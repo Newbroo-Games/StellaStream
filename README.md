@@ -21,7 +21,8 @@ Linux too, but nobody has tried them yet.
 
 - Python 3.10 or newer, with tkinter (the python.org installers include it).
   Nothing else to install from pip.
-- [ffmpeg](https://ffmpeg.org/), on the PATH or chosen in the window.
+- [ffmpeg](https://ffmpeg.org/), on the PATH or chosen in the window, for
+  videos (captures and GIFs don't need it).
 - A Stella build with `-rawstream`. Until Stella itself has it, build the
   `rawstream-7.0c` branch of
   [Newbroo-Games/stella](https://github.com/Newbroo-Games/stella/tree/rawstream-7.0c):
@@ -67,6 +68,12 @@ Good to know:
   see the option at work, or copy it.
 - **More options:** the Stella and ffmpeg programs, extra Stella options, the
   video quality, and keeping the separate picture and sound files.
+- **Video or GIF from a capture:** choose a capture, type the part you want
+  (**From** and **To**, in minutes:seconds; leave them empty for the start
+  and the end) and press **Make video**. The video is named after the
+  capture (`game-clip.mp4`) and has the size, stereo sound and quality set
+  for recording. Name it `.gif` instead and the button becomes **Make GIF**
+  (see [Animated GIFs](#animated-gifs)).
 - Every field is remembered, in `%APPDATA%\StellaStream\settings.json` on
   Windows and `~/.config/StellaStream/settings.json` elsewhere.
 
@@ -109,6 +116,15 @@ Make a video from it:
 python record.py game.sscap game.mp4
 ```
 
+Cut a clip, as a video or as a smaller capture. The times are the same as in
+the whole video, in seconds or minutes:seconds; leave out `--to` to go to the
+end:
+
+```
+python record.py game.sscap clip.mp4 --from 1:20 --to 1:45
+python sscap.py game.sscap clip.sscap --from 1:20 --to 1:45
+```
+
 Pack a raw stream, unpack a capture again, or check one (`-v`: a line per
 block):
 
@@ -119,6 +135,24 @@ python sscap.py game.sscap -v
 ```
 
 The format is described in [docs/capture-format.md](docs/capture-format.md).
+
+## Animated GIFs
+
+Name the file `.gif` and you get an animated GIF of the capture, or of a
+clip of it:
+
+```
+python record.py game.sscap clip.gif --from 1:20 --to 1:25
+```
+
+Every pixel keeps Stella's own color (nothing dithered or blurred), drawn in
+the TV shape, 640 wide. A GIF can't show 60 frames a second (browsers slow
+down anything faster than 50), so it runs at 50: from an NTSC game one frame
+in six is left out, a PAL game keeps them all. Only the part of each frame
+that changed is stored, which keeps the files small. A GIF has no sound, and
+StellaStream writes it itself: no ffmpeg needed. A raw stream file works too;
+a recording with `--rom` doesn't (record a capture, then make the GIF from
+it).
 
 ## Check a stream
 
@@ -138,9 +172,10 @@ python -m unittest discover -s tests -t .
 The tests build their own tiny 2600 ROM (`tests/testrom.py`), run Stella on it
 silently with a settings folder of their own, and check the stream, the RAM
 against the picture, the videos, and capture files (a round trip byte for
-byte, damaged files, the format spec's own decoder). The window's tests build it hidden, on a
-settings file of their own, and record that ROM from it. Without Stella or
-ffmpeg those tests are skipped.
+byte, damaged files, the format spec's own decoder), and GIFs (read back by a
+GIF reader of the tests' own, and by ffmpeg). The window's tests build it
+hidden, on a settings file of their own, and record that ROM from it. Without
+Stella or ffmpeg those tests are skipped.
 
 ## License
 
