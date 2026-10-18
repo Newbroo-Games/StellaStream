@@ -3,7 +3,8 @@
 # StellaStream
 
 Record Atari 2600 games played in the [Stella](https://stella-emu.github.io/)
-emulator to MP4 videos, frame-perfect and with the sound in sync.
+emulator to MP4 videos, frame-perfect* and with the sound in sync.
+("Frame-perfect" at 262 scanlines. Variable scanlines can be tuned.)
 
 ![Four seconds of a test ROM, recorded with StellaStream](images/demo.gif)
 
